@@ -238,9 +238,58 @@ def download_video(url, output_dir=None):
 
 # ─── Step 2: 压缩 ────────────────────────────────────────────────────────────
 
+def _get_compression_tier(duration):
+    """根据视频时长决定压缩策略"""
+    if duration <= 300:  # ≤5min
+        return {
+            "label": "短视频",
+            "scale": "min(1280,iw):-2",
+            "fps": None,  # 保持原始帧率
+            "audio_bitrate": 96,
+            "audio_channels": 2,
+            "audio_rate": None,
+            "crf": 28,
+            "preset": "fast",
+        }
+    elif duration <= 900:  # 5-15min
+        return {
+            "label": "中等时长",
+            "scale": "min(960,iw):-2",
+            "fps": 24,
+            "audio_bitrate": 64,
+            "audio_channels": 1,
+            "audio_rate": 44100,
+            "crf": 30,
+            "preset": "fast",
+        }
+    elif duration <= 1800:  # 15-30min
+        return {
+            "label": "长视频",
+            "scale": "min(640,iw):-2",
+            "fps": 15,
+            "audio_bitrate": 48,
+            "audio_channels": 1,
+            "audio_rate": 32000,
+            "crf": 32,
+            "preset": "medium",
+        }
+    else:  # >30min
+        return {
+            "label": "超长视频",
+            "scale": "min(480,iw):-2",
+            "fps": 10,
+            "audio_bitrate": 32,
+            "audio_channels": 1,
+            "audio_rate": 24000,
+            "crf": 34,
+            "preset": "medium",
+        }
+
+
 def compress_video(input_path, output_path=None, target_size=TARGET_FILE_SIZE):
     """
     压缩视频到目标大小。
+    根据视频时长自动选择压缩策略：短视频保持高质量，长视频降低分辨率/帧率。
     如果原始文件已够小，只做 faststart 处理。
     """
     if output_path is None:
@@ -267,50 +316,103 @@ def compress_video(input_path, output_path=None, target_size=TARGET_FILE_SIZE):
         duration = 60.0
         log("无法获取时长，假设 60 秒", "WARN")
 
-    def do_compress(tgt_size):
+    tier = _get_compression_tier(duration)
+    log(f"视频时长 {duration:.0f}s，使用「{tier['label']}」压缩策略")
+
+    def do_compress(tgt_size, src_path, compression_tier):
         target_bitrate_kbps = int((tgt_size * 8) / duration / 1024 * 0.9)
-        target_bitrate_kbps = max(target_bitrate_kbps, 200)
-        audio_bitrate = 96
-        video_bitrate = target_bitrate_kbps - audio_bitrate
+        target_bitrate_kbps = max(target_bitrate_kbps, 100)
+        audio_bitrate = compression_tier["audio_bitrate"]
+        video_bitrate = max(target_bitrate_kbps - audio_bitrate, 50)
 
         log(f"目标码率: {video_bitrate}k video + {audio_bitrate}k audio (时长 {duration:.0f}s)")
 
+        # 构建 video filter
+        vf_parts = [f"scale={compression_tier['scale']}:force_original_aspect_ratio=decrease"]
+        if compression_tier["fps"]:
+            vf_parts.append(f"fps={compression_tier['fps']}")
+        vf_str = ",".join(vf_parts)
+
         tmp_out = output_path + ".tmp.mp4"
         cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "28",
-            "-b:v", f"{video_bitrate}k", "-maxrate", f"{int(video_bitrate * 1.5)}k",
+            "ffmpeg", "-y", "-i", src_path,
+            "-c:v", "libx264",
+            "-preset", compression_tier["preset"],
+            "-crf", str(compression_tier["crf"]),
+            "-b:v", f"{video_bitrate}k",
+            "-maxrate", f"{int(video_bitrate * 1.5)}k",
             "-bufsize", f"{video_bitrate * 2}k",
-            "-vf", "scale='min(1280,iw)':min'(720,ih)':force_original_aspect_ratio=decrease",
+            "-vf", vf_str,
             "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
-            "-movflags", "+faststart",
-            tmp_out
+            "-ac", str(compression_tier["audio_channels"]),
         ]
+        if compression_tier["audio_rate"]:
+            cmd += ["-ar", str(compression_tier["audio_rate"])]
+        cmd += ["-movflags", "+faststart", tmp_out]
+
         run_cmd(cmd)
         os.rename(tmp_out, output_path)
         return output_path
 
-    # 第一次压缩
-    do_compress(target_size)
+    # 第一次压缩（按时长选择的策略）
+    do_compress(target_size, input_path, tier)
     result_b64_size = base64_size(output_path)
     result_fsize = get_file_size(output_path)
     log(f"压缩结果: {result_fsize / 1024 / 1024:.1f}MB (base64 ≈ {result_b64_size / 1024 / 1024:.1f}MB)")
 
-    # 如果仍超限，二次压缩
+    # 如果仍超限，使用更激进的策略二次压缩
     if result_b64_size > MAX_BASE64_BYTES:
-        log("base64 仍超限，执行二次压缩", "WARN")
-        second_target = int(target_size * 0.6)
-        backup = input_path
-        input_path = output_path
-        do_compress(second_target)
+        log("base64 仍超限，升级到更激进压缩策略", "WARN")
+        # 升级到更高的压缩层级
+        aggressive_tier = _get_compression_tier(duration + 1800)  # 强制升一级
+        aggressive_tier["crf"] = min(aggressive_tier["crf"] + 2, 38)
+        log(f"二次压缩使用「{aggressive_tier['label']}+」策略")
+        do_compress(int(target_size * 0.5), output_path, aggressive_tier)
         result_b64_size = base64_size(output_path)
         result_fsize = get_file_size(output_path)
         log(f"二次压缩结果: {result_fsize / 1024 / 1024:.1f}MB (base64 ≈ {result_b64_size / 1024 / 1024:.1f}MB)")
 
+        # 如果还是超限，终极压缩：最低画质
         if result_b64_size > MAX_BASE64_BYTES:
-            log("二次压缩后仍超限，视频可能过长", "ERROR")
+            log("仍然超限，执行终极压缩 (320p, 8fps, 24k audio)", "WARN")
+            ultra_tier = {
+                "label": "终极压缩",
+                "scale": "min(320,iw):-2",
+                "fps": 8,
+                "audio_bitrate": 24,
+                "audio_channels": 1,
+                "audio_rate": 16000,
+                "crf": 38,
+                "preset": "slow",
+            }
+            do_compress(int(target_size * 0.35), output_path, ultra_tier)
+            result_b64_size = base64_size(output_path)
+            result_fsize = get_file_size(output_path)
+            log(f"终极压缩结果: {result_fsize / 1024 / 1024:.1f}MB (base64 ≈ {result_b64_size / 1024 / 1024:.1f}MB)")
+
+            if result_b64_size > MAX_BASE64_BYTES:
+                log("终极压缩后仍超限，需要裁剪视频", "ERROR")
 
     return output_path
+
+
+def trim_video(input_path, output_path, max_duration_sec):
+    """裁剪视频到指定最大时长（秒），用于超长视频无法压缩到API限制时的降级方案"""
+    duration = get_video_duration(input_path)
+    if duration <= max_duration_sec:
+        log(f"视频时长 {duration:.0f}s <= {max_duration_sec}s，无需裁剪")
+        return input_path, False
+
+    log(f"裁剪视频: {duration:.0f}s -> {max_duration_sec}s")
+    run_cmd([
+        "ffmpeg", "-y", "-i", input_path,
+        "-t", str(max_duration_sec),
+        "-c", "copy", "-movflags", "+faststart",
+        output_path
+    ])
+    trimmed_duration = get_video_duration(output_path)
+    log(f"裁剪完成: {trimmed_duration:.0f}s ({get_file_size(output_path) / 1024 / 1024:.1f}MB)")
+    return output_path, True
 
 
 # ─── Step 3 & 4: API 分析 ─────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ SKILL_DIR = SCRIPT_DIR.parent
 from video_analyzer import (
     download_video,
     compress_video,
+    trim_video,
     extract_frames,
     call_doubao_api,
     extract_json_from_text,
@@ -33,6 +34,9 @@ from video_analyzer import (
     base64_size,
     MAX_BASE64_BYTES,
 )
+
+# 超长视频裁剪阈值：压缩后仍超限时，裁剪到此时长再压缩
+MAX_TRIM_DURATION = 20 * 60  # 20 分钟
 
 
 # ─── 学习分析 Prompt ─────────────────────────────────────────────────────────
@@ -161,6 +165,62 @@ def build_scene_learning_prompt(sections):
 4. 输出纯 JSON"""
 
 
+# ─── JSON 解析 fallback ──────────────────────────────────────────────────────
+
+def _fallback_parse_json(text):
+    """
+    当 extract_json_from_text 失败时的多策略 fallback：
+    1. 去除不可见字符/BOM 后直接 json.loads
+    2. 去除 markdown 代码块标记后重试
+    3. 用正则提取最大的 {...} 块
+    """
+    if not text or not text.strip():
+        return None
+
+    # 策略1: 去除 BOM、零宽字符后直接解析
+    cleaned = text.strip().lstrip('\ufeff\u200b\u200c\u200d\u2060')
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 策略2: 去除 markdown 代码块包裹
+    import re
+    stripped = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
+    stripped = re.sub(r'\n?\s*```\s*$', '', stripped)
+    try:
+        return json.loads(stripped.strip())
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 策略3: 贪婪匹配最大的 JSON 对象
+    # 找到第一个 { 和最后一个 }，取整个区间
+    first_brace = cleaned.find('{')
+    last_brace = cleaned.rfind('}')
+    if first_brace >= 0 and last_brace > first_brace:
+        candidate = cleaned[first_brace:last_brace + 1]
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 策略4: 逐行清理（去除行首行尾的非 JSON 字符）
+    lines = cleaned.split('\n')
+    # 去掉首尾不含 {} 的行
+    while lines and '{' not in lines[0] and '[' not in lines[0]:
+        lines.pop(0)
+    while lines and '}' not in lines[-1] and ']' not in lines[-1]:
+        lines.pop()
+    if lines:
+        try:
+            return json.loads('\n'.join(lines))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    log("_fallback_parse_json: 所有策略均失败", "ERROR")
+    return None
+
+
 # ─── 分析流程 ─────────────────────────────────────────────────────────────────
 
 def analyze_video(video_path, title="", source_url=""):
@@ -186,7 +246,11 @@ def analyze_video(video_path, title="", source_url=""):
     analysis = extract_json_from_text(analysis_text)
 
     if analysis is None:
-        log("JSON 解析失败，保存原始响应", "ERROR")
+        log("extract_json_from_text 解析失败，尝试 fallback 恢复...", "WARN")
+        analysis = _fallback_parse_json(analysis_text)
+
+    if analysis is None:
+        log("所有 JSON 解析方法均失败，保存原始响应", "ERROR")
         analysis = {"_raw_response": analysis_text, "learning_rating": 0}
 
     log(f"分析完成，learning_rating = {analysis.get('learning_rating', 'N/A')}")
@@ -221,6 +285,8 @@ def analyze_video(video_path, title="", source_url=""):
         scene_prompt = build_scene_learning_prompt(chapters)
         scene_text = call_doubao_api(video_b64, scene_prompt)
         scenes_data = extract_json_from_text(scene_text)
+        if scenes_data is None:
+            scenes_data = _fallback_parse_json(scene_text)
 
         if scenes_data:
             analysis["scene_breakdown"] = scenes_data
@@ -317,9 +383,32 @@ def run_pipeline(source, title="", archive_dir="./outputs/learning"):
     compressed_path = os.path.join(tmp_dir, "compressed.mp4")
     compressed_path = compress_video(video_path, compressed_path)
 
+    # Step 2.5: 如果压缩后仍超 API 限制，裁剪视频
+    is_trimmed = False
+    original_duration = get_video_duration(video_path)
+    if base64_size(compressed_path) > MAX_BASE64_BYTES:
+        log("压缩后仍超 API 限制，尝试裁剪视频", "WARN")
+        trimmed_path = os.path.join(tmp_dir, "trimmed.mp4")
+        trimmed_path, is_trimmed = trim_video(
+            video_path, trimmed_path, MAX_TRIM_DURATION
+        )
+        if is_trimmed:
+            log(f"已裁剪到 {MAX_TRIM_DURATION // 60} 分钟，重新压缩...")
+            compressed_path = os.path.join(tmp_dir, "compressed_trimmed.mp4")
+            compressed_path = compress_video(trimmed_path, compressed_path)
+
     # Step 3: 分析
     source_url = source if not os.path.isfile(source) else ""
     analysis = analyze_video(compressed_path, title, source_url)
+
+    # 标记是否为部分分析
+    if is_trimmed:
+        analysis["_meta_trimmed"] = {
+            "original_duration": original_duration,
+            "analyzed_duration": get_video_duration(compressed_path),
+            "note": f"视频过长（{original_duration/60:.0f}分钟），仅分析前 {MAX_TRIM_DURATION // 60} 分钟内容"
+        }
+        log(f"注意：视频原始时长 {original_duration/60:.0f} 分钟，仅分析了前 {MAX_TRIM_DURATION // 60} 分钟")
 
     # Step 4: 生成报告
     log("=" * 60)
