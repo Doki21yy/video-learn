@@ -20,8 +20,10 @@ SKILL_DIR = SCRIPT_DIR.parent
 from video_analyzer import (
     download_video,
     compress_video,
+    trim_video,
     extract_frames,
     call_doubao_api,
+    call_doubao_text_api,
     extract_json_from_text,
     file_to_base64,
     get_video_duration,
@@ -32,7 +34,13 @@ from video_analyzer import (
     detect_platform,
     base64_size,
     MAX_BASE64_BYTES,
+    YouTubeDownloadError,
+    download_youtube_transcript,
+    get_youtube_video_info,
 )
+
+# 超长视频裁剪阈值：压缩后仍超限时，裁剪到此时长再压缩
+MAX_TRIM_DURATION = 20 * 60  # 20 分钟
 
 
 # ─── 学习分析 Prompt ─────────────────────────────────────────────────────────
@@ -161,6 +169,197 @@ def build_scene_learning_prompt(sections):
 4. 输出纯 JSON"""
 
 
+# ─── JSON 解析 fallback ──────────────────────────────────────────────────────
+
+def _fallback_parse_json(text):
+    """
+    当 extract_json_from_text 失败时的多策略 fallback：
+    1. 去除不可见字符/BOM 后直接 json.loads
+    2. 去除 markdown 代码块标记后重试
+    3. 用正则提取最大的 {...} 块
+    """
+    if not text or not text.strip():
+        return None
+
+    # 策略1: 去除 BOM、零宽字符后直接解析
+    cleaned = text.strip().lstrip('\ufeff\u200b\u200c\u200d\u2060')
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 策略2: 去除 markdown 代码块包裹
+    import re
+    stripped = re.sub(r'^```(?:json)?\s*\n?', '', cleaned)
+    stripped = re.sub(r'\n?\s*```\s*$', '', stripped)
+    try:
+        return json.loads(stripped.strip())
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 策略3: 贪婪匹配最大的 JSON 对象
+    # 找到第一个 { 和最后一个 }，取整个区间
+    first_brace = cleaned.find('{')
+    last_brace = cleaned.rfind('}')
+    if first_brace >= 0 and last_brace > first_brace:
+        candidate = cleaned[first_brace:last_brace + 1]
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # 策略4: 逐行清理（去除行首行尾的非 JSON 字符）
+    lines = cleaned.split('\n')
+    # 去掉首尾不含 {} 的行
+    while lines and '{' not in lines[0] and '[' not in lines[0]:
+        lines.pop(0)
+    while lines and '}' not in lines[-1] and ']' not in lines[-1]:
+        lines.pop()
+    if lines:
+        try:
+            return json.loads('\n'.join(lines))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    log("_fallback_parse_json: 所有策略均失败", "ERROR")
+    return None
+
+
+# ─── 字幕/转录 纯文本分析 ────────────────────────────────────────────────────
+
+def build_learning_prompt_transcript():
+    """构建基于字幕/转录文本的学习分析 prompt（无视频画面）"""
+    return """你是一位顶级技术文档撰写者和学习指南设计师。以下是一段 YouTube 视频的完整字幕/转录文本（带时间戳）。
+
+请基于这些文本内容，生成一份**全面、实用、可直接用来学习**的深度知识文档。
+
+注意：你只有文本转录，没有视频画面信息。请专注于语言内容的分析。
+
+你的目标不是简单总结"视频讲了什么"，而是创建一份**让没看过视频的人也能完全掌握核心知识**的学习指南。
+
+请输出严格的 JSON（不要有多余文字），格式如下：
+
+{
+  "title_cn": "<视频标题的中文翻译/解释版本（如果是中文视频就保持原标题）>",
+  "topic": "<视频主题，简短概括>",
+  "category": "<分类标签，如：AI工具/编程/3D动画/设计/商业/科学/...>",
+  "tags": ["<关键词标签1>", "<标签2>", "<标签3>"],
+  "difficulty": "<beginner|intermediate|advanced>",
+  "learning_rating": <float 1-10, 内容的学习价值评分>,
+  "speaker": "<讲者/UP主/频道名称，如能从内容推断>",
+  "language": "<视频语言，如 中文/英文/日文>",
+  "video_info": {
+    "publish_date": "<如能识别>",
+    "views_estimate": ""
+  },
+  "overview": "<300-500字的核心内容概述。要用流畅的中文叙述视频的核心主题、解决了什么问题、核心方法/技术是什么、最终效果如何。如果是英文视频，概述必须用中文写。>",
+  "sections": [
+    {
+      "title": "<知识板块标题，按主题组织而非时间线>",
+      "content": "<该板块的详细内容，用中文 Markdown 格式撰写。要求：\\n1. 每个板块 200-800 字\\n2. 深入解释核心原理和概念\\n3. 如果涉及操作步骤，用编号列表详细写出\\n4. 保留重要的英文术语（首次出现时括号标注英文原文）\\n5. 遇到代码、命令行、提示词时用代码块格式>",
+      "subsections": [
+        {
+          "title": "<子标题>",
+          "content": "<子板块详细内容>"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "name": "<工具/模型/网站名称>",
+      "url": "<如果转录中提到了链接>",
+      "description": "<简短描述用途>",
+      "type": "<tool|model|website|tutorial|template|other>"
+    }
+  ],
+  "key_tips": [
+    "<实用技巧/最佳实践1：要具体>",
+    "<技巧2>",
+    "<技巧3>"
+  ],
+  "faq": [
+    {
+      "question": "<常见问题或容易踩的坑>",
+      "answer": "<解决方法或建议>"
+    }
+  ],
+  "hardware_requirements": "<如果涉及软件/模型，说明硬件需求，否则为空字符串>",
+  "target_audience": ["<适合人群1>", "<适合人群2>"],
+  "summary": "<200-300字的总结，概括核心价值、最大亮点、关键结论>",
+  "related_links": [
+    {
+      "label": "<链接描述>",
+      "url": "<链接地址>"
+    }
+  ]
+}
+
+**核心要求：**
+
+1. **深度 > 广度**：每个 section 要深入讲透。
+2. **按知识主题组织，不是按时间线**：按"核心原理"、"详细步骤"、"高级用法"这样的知识结构组织。
+3. **提取所有资源和链接**：转录中提到的每一个工具名、模型名、网站名都要提取到 resources 中。
+4. **中文撰写**：即使是英文视频，所有内容必须用中文撰写。重要英文术语保留原文。
+5. **实用导向**：key_tips 和 faq 要是真正实用的信息。
+6. **sections 数量**：通常 3-8 个 section。
+7. 输出纯 JSON，不要包裹在代码块中"""
+
+
+def analyze_transcript(transcript_text, title="", source_url="", video_info=None):
+    """
+    基于字幕/转录文本进行纯文本分析（无视频）。
+    当 YouTube 视频下载失败但字幕可用时的 fallback。
+    """
+    log("=" * 60)
+    log("使用字幕/转录文本进行纯文本分析（Transcript Fallback）")
+    log("=" * 60)
+
+    transcript_len = len(transcript_text)
+    log(f"转录文本长度: {transcript_len} 字符")
+
+    # 如果文本太长，截断到前 30000 字符（约 15000 个中文字或 5000 个英文单词）
+    if transcript_len > 30000:
+        log(f"转录文本过长 ({transcript_len})，截断到 30000 字符", "WARN")
+        transcript_text = transcript_text[:30000] + "\n\n[... 后续内容已截断 ...]"
+
+    # Stage 1: 内容学习分析
+    log("Stage 1: 基于转录的内容学习分析")
+    learning_prompt = build_learning_prompt_transcript()
+    analysis_text = call_doubao_text_api(transcript_text, learning_prompt)
+    analysis = extract_json_from_text(analysis_text)
+
+    if analysis is None:
+        log("extract_json_from_text 解析失败，尝试 fallback 恢复...", "WARN")
+        analysis = _fallback_parse_json(analysis_text)
+
+    if analysis is None:
+        log("所有 JSON 解析方法均失败，保存原始响应", "ERROR")
+        analysis = {"_raw_response": analysis_text, "learning_rating": 0}
+
+    log(f"分析完成，learning_rating = {analysis.get('learning_rating', 'N/A')}")
+
+    # 添加元数据
+    analysis["_meta"] = {
+        "title": title,
+        "type": "learning",
+        "analysis_mode": "transcript",  # 标记为转录模式
+        "analyzed_at": datetime.now().isoformat(),
+        "transcript_length": transcript_len,
+        "source_url": source_url,
+    }
+
+    # 合并视频元信息
+    if video_info:
+        analysis["_meta"]["video_duration"] = video_info.get("duration", 0)
+        analysis["_meta"]["channel"] = video_info.get("channel", "")
+        analysis["_meta"]["thumbnail"] = video_info.get("thumbnail", "")
+        if not title and video_info.get("title"):
+            analysis["_meta"]["title"] = video_info["title"]
+
+    return analysis
+
+
 # ─── 分析流程 ─────────────────────────────────────────────────────────────────
 
 def analyze_video(video_path, title="", source_url=""):
@@ -186,7 +385,11 @@ def analyze_video(video_path, title="", source_url=""):
     analysis = extract_json_from_text(analysis_text)
 
     if analysis is None:
-        log("JSON 解析失败，保存原始响应", "ERROR")
+        log("extract_json_from_text 解析失败，尝试 fallback 恢复...", "WARN")
+        analysis = _fallback_parse_json(analysis_text)
+
+    if analysis is None:
+        log("所有 JSON 解析方法均失败，保存原始响应", "ERROR")
         analysis = {"_raw_response": analysis_text, "learning_rating": 0}
 
     log(f"分析完成，learning_rating = {analysis.get('learning_rating', 'N/A')}")
@@ -221,6 +424,8 @@ def analyze_video(video_path, title="", source_url=""):
         scene_prompt = build_scene_learning_prompt(chapters)
         scene_text = call_doubao_api(video_b64, scene_prompt)
         scenes_data = extract_json_from_text(scene_text)
+        if scenes_data is None:
+            scenes_data = _fallback_parse_json(scene_text)
 
         if scenes_data:
             analysis["scene_breakdown"] = scenes_data
@@ -234,6 +439,16 @@ def analyze_video(video_path, title="", source_url=""):
             analysis["scene_breakdown"] = {"_raw_response": scene_text}
     else:
         log("无法获取章节信息，跳过场景细拆", "WARN")
+
+    # 抽帧截图（用于封面和时间线）
+    log("抽取视频帧截图...")
+    tmp_frame_dir = tempfile.mkdtemp(prefix="vlearn_frames_")
+    frames = extract_frames(video_path, tmp_frame_dir)
+    if frames:
+        analysis["_frames"] = frames
+        log(f"抽帧完成: {len(frames)} 帧")
+    else:
+        log("抽帧失败，报告将不包含截图", "WARN")
 
     # 添加元数据
     analysis["_meta"] = {
@@ -258,10 +473,10 @@ def generate_report(analysis_data, video_path, title, archive_dir):
     report_dir = os.path.join(archive_dir, f"{date_str}_{slug}")
     os.makedirs(report_dir, exist_ok=True)
 
-    # 保存分析 JSON
+    # 保存分析 JSON（保留 _frames 用于封面提取，排除 _video_base64）
     json_path = os.path.join(report_dir, "analysis.json")
     save_data = {k: v for k, v in analysis_data.items()
-                 if not k.startswith("_video_base64") and not k.startswith("_frames")}
+                 if not k.startswith("_video_base64")}
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
 
@@ -279,6 +494,40 @@ def generate_report(analysis_data, video_path, title, archive_dir):
     return report_dir
 
 
+def generate_report_transcript(analysis_data, title, archive_dir):
+    """生成转录模式的 HTML 报告（无视频，使用 YouTube 内嵌播放器）"""
+    date_str = datetime.now().strftime("%Y%m%d")
+    slug = slugify(title)
+    report_dir = os.path.join(archive_dir, f"{date_str}_{slug}")
+    os.makedirs(report_dir, exist_ok=True)
+
+    # 保存分析 JSON（排除大量转录文本，保留摘要）
+    json_path = os.path.join(report_dir, "analysis.json")
+    save_data = {k: v for k, v in analysis_data.items()
+                 if k not in ("_transcript_text", "_raw_transcript")}
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(save_data, f, ensure_ascii=False, indent=2)
+
+    # 保存转录文本到单独文件
+    if "_transcript_text" in analysis_data:
+        transcript_path = os.path.join(report_dir, "transcript.txt")
+        with open(transcript_path, "w", encoding="utf-8") as f:
+            f.write(analysis_data["_transcript_text"])
+
+    # 调用 learn_report.py 生成 HTML
+    report_gen = os.path.join(SCRIPT_DIR, "learn_report.py")
+    cmd = [
+        sys.executable, report_gen,
+        "--analysis-json", json_path,
+        "--title", title,
+        "--output-dir", report_dir,
+    ]
+    run_cmd(cmd)
+
+    log(f"转录模式报告已生成: {report_dir}/")
+    return report_dir
+
+
 # ─── 完整流水线 ───────────────────────────────────────────────────────────────
 
 def run_pipeline(source, title="", archive_dir="./outputs/learning"):
@@ -293,12 +542,88 @@ def run_pipeline(source, title="", archive_dir="./outputs/learning"):
             title = "视频学习笔记"
 
     tmp_dir = tempfile.mkdtemp(prefix="video_learn_")
+    source_url = source if not os.path.isfile(source) else ""
+    is_transcript_mode = False
 
-    # Step 1: 下载
+    # Step 1: 下载视频
     log("=" * 60)
     log("Step 1: 下载视频")
     log("=" * 60)
-    video_path = download_video(source, tmp_dir)
+
+    video_path = None
+    try:
+        video_path = download_video(source, tmp_dir)
+    except YouTubeDownloadError as e:
+        log(f"YouTube 视频下载失败: {e}", "WARN")
+        log("=" * 60)
+        log("Step 1b: 尝试字幕/转录 Fallback")
+        log("=" * 60)
+
+        # 尝试获取视频元信息
+        video_info = get_youtube_video_info(source)
+        if video_info and not title:
+            title = video_info.get("title", title)
+            log(f"获取到视频标题: {title}")
+
+        # 尝试下载字幕
+        transcript_text, lang, raw_transcript = download_youtube_transcript(source, tmp_dir)
+
+        if transcript_text:
+            log(f"字幕获取成功 (语言={lang})，切换到纯文本分析模式")
+            is_transcript_mode = True
+
+            # 使用纯文本分析
+            analysis = analyze_transcript(transcript_text, title, source_url, video_info)
+
+            # 保存转录文本到归档目录
+            analysis["_transcript_text"] = transcript_text
+            if raw_transcript:
+                analysis["_raw_transcript"] = raw_transcript
+
+            # 跳过视频压缩和视频分析，直接生成报告
+            log("=" * 60)
+            log("Step 4: 生成学习报告（转录模式）")
+            log("=" * 60)
+            report_dir = generate_report_transcript(analysis, title, archive_dir)
+
+            report_html = os.path.join(report_dir, "report.html")
+            report_lite = os.path.join(report_dir, "report-lite.html")
+
+            log("=" * 60)
+            log("流水线完成! (转录模式)")
+            log(f"完整报告: {report_html}")
+            log(f"轻量报告: {report_lite}")
+            log(f"归档目录: {report_dir}")
+            log("=" * 60)
+
+            # Auto-sync to GitHub
+            try:
+                from github_sync import auto_sync
+                auto_sync(report_dir)
+            except Exception as e:
+                log(f"GitHub sync skipped: {e}")
+
+            return {
+                "report_dir": report_dir,
+                "report_html": report_html,
+                "report_lite": report_lite,
+                "analysis": analysis,
+                "mode": "transcript",
+            }
+        else:
+            log("字幕也获取失败，无法继续分析", "ERROR")
+            log("=" * 60, "ERROR")
+            log("YouTube 视频和字幕均无法获取。", "ERROR")
+            log("建议：在本地下载视频后上传使用。", "ERROR")
+            log("=" * 60, "ERROR")
+            sys.exit(2)
+    except SystemExit as e:
+        if e.code == 2:
+            # 非 YouTube 平台的 exit(2)，需要浏览器 fallback
+            raise
+        raise
+
+    # --- 正常视频分析路径 ---
 
     # Step 2: 压缩
     log("=" * 60)
@@ -307,9 +632,31 @@ def run_pipeline(source, title="", archive_dir="./outputs/learning"):
     compressed_path = os.path.join(tmp_dir, "compressed.mp4")
     compressed_path = compress_video(video_path, compressed_path)
 
+    # Step 2.5: 如果压缩后仍超 API 限制，裁剪视频
+    is_trimmed = False
+    original_duration = get_video_duration(video_path)
+    if base64_size(compressed_path) > MAX_BASE64_BYTES:
+        log("压缩后仍超 API 限制，尝试裁剪视频", "WARN")
+        trimmed_path = os.path.join(tmp_dir, "trimmed.mp4")
+        trimmed_path, is_trimmed = trim_video(
+            video_path, trimmed_path, MAX_TRIM_DURATION
+        )
+        if is_trimmed:
+            log(f"已裁剪到 {MAX_TRIM_DURATION // 60} 分钟，重新压缩...")
+            compressed_path = os.path.join(tmp_dir, "compressed_trimmed.mp4")
+            compressed_path = compress_video(trimmed_path, compressed_path)
+
     # Step 3: 分析
-    source_url = source if not os.path.isfile(source) else ""
     analysis = analyze_video(compressed_path, title, source_url)
+
+    # 标记是否为部分分析
+    if is_trimmed:
+        analysis["_meta_trimmed"] = {
+            "original_duration": original_duration,
+            "analyzed_duration": get_video_duration(compressed_path),
+            "note": f"视频过长（{original_duration/60:.0f}分钟），仅分析前 {MAX_TRIM_DURATION // 60} 分钟内容"
+        }
+        log(f"注意：视频原始时长 {original_duration/60:.0f} 分钟，仅分析了前 {MAX_TRIM_DURATION // 60} 分钟")
 
     # Step 4: 生成报告
     log("=" * 60)
@@ -338,7 +685,8 @@ def run_pipeline(source, title="", archive_dir="./outputs/learning"):
         "report_dir": report_dir,
         "report_html": report_html,
         "report_lite": report_lite,
-        "analysis": analysis
+        "analysis": analysis,
+        "mode": "video",
     }
 
 

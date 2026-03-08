@@ -71,16 +71,20 @@ Step 1: 尝试 yt-dlp 下载
   成功（exit 0）-> 完成（报告+GitHub自动同步）
   失败（exit 2）-> Step 2
 
-Step 2: 浏览器 fallback
+  注意：YouTube 视频下载失败时，run 命令会自动尝试字幕 fallback：
+  - 下载字幕 -> 纯文本AI分析 -> 生成报告（使用YouTube iframe播放器）
+  - 字幕也失败时才 exit 2
+
+Step 2: 浏览器 fallback（仅B站/小红书/抖音需要）
   读取 ~/.claude/skills/video-learn/FALLBACK.md
   按对应平台方案下载视频到 /tmp/
 
   关键点：
   - B站第一次可能 412，等 5 秒重新 navigate
   - B站用 __playinfo__.data.dash，视频+音频分下载后 ffmpeg 合并
-  - YouTube 用 ytInitialPlayerResponse.streamingData
-  - 小红书用 __INITIAL_STATE__ 的 masterUrl
-  - 抖音用 /aweme/v1/web/aweme/detail/ API
+  - YouTube：不需要浏览器 fallback（run 命令已内置字幕 fallback）
+  - 小红书用 __INITIAL_STATE__ 的 masterUrl（注意帖子页需要 xsec_token 参数）
+  - 抖音用 /aweme/v1/web/aweme/detail/ API（异步，需分两步：存到 window 变量 + sleep 后读取）
 
 Step 3: 本地文件继续（需注入 source_url）
   # 压缩
@@ -141,14 +145,44 @@ Step 5: 输出
 
 | 情况 | 处理 |
 |------|------|
-| yt-dlp 被反爬 (412/403) | 自动走 FALLBACK.md 浏览器方案 |
+| YouTube 反爬 (SABR/403) | 内置 5 种视频下载策略 -> 字幕下载 fallback -> 纯文本分析 |
+| YouTube 视频下载全部失败 | 自动尝试下载字幕（4种策略+timedtext API），用字幕文本进行AI分析 |
+| B站/小红书/抖音反爬 | 自动走 FALLBACK.md 浏览器方案 |
 | API 调用失败 | 内置 3 次重试；全部失败检查 Key |
-| 视频过大 (>50MB base64) | 自动二次压缩 |
+| 视频过大 (>50MB base64) | 自适应压缩（按时长分4级：720p/960p/640p/480p） |
+| 超长视频 (>30min) | 压缩失败时自动裁剪到前20分钟 |
+
+## YouTube 多层 Fallback 策略
+
+YouTube 在数据中心 IP 上有严格的 bot 检测。skill 内置了多层 fallback 机制：
+
+**第1层：视频下载（5-7种策略）**
+- node JS runtime + 720p/480p/360p
+- mweb/android_vr player client
+- PO Token (bgutil) 如可用
+- Playwright cookie 提取
+
+**第2层：字幕下载（4种策略+API）**
+- yt-dlp `--skip-download --write-auto-sub --write-sub`（参考 youtube-ai-digest 方案）
+- 多语言字幕（en/zh/ja）
+- mweb player client 字幕
+- YouTube timedtext API 直接请求
+
+**第3层：纯文本分析**
+- 当视频和字幕均获取成功时，使用字幕文本进行 AI 分析
+- 报告使用 YouTube iframe 内嵌播放器（用户可在报告中直接观看）
+- 分析质量略低于视频分析，但仍能提取核心知识点
+
+遇到视频和字幕全部失败时：
+1. **推荐**：在本地电脑下载视频后上传，使用本地文件路径
+2. **高级**：导出 YouTube cookies（Netscape 格式）到 `~/.claude/skills/video-learn/.yt_cookies.txt`
+3. 或设置环境变量：`export YOUTUBE_COOKIES=/path/to/cookies.txt`
 
 ## 依赖
 
 - `python3`（标准库）
 - `ffmpeg` / `ffprobe`
 - `yt-dlp`（B站/YouTube）
+- `playwright`（可选，用于 YouTube cookie 提取）
 
 **运行前**：`export PATH="/home/node/.local/bin:$PATH"`

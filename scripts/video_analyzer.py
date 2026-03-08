@@ -29,6 +29,13 @@ MAX_RETRIES = 3
 SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 
+
+class YouTubeDownloadError(Exception):
+    """YouTube 视频下载失败（所有策略均失败）"""
+    def __init__(self, message, is_bot_detected=False):
+        super().__init__(message)
+        self.is_bot_detected = is_bot_detected
+
 # ─── API Key 加载（优先级：环境变量 > 配置文件）─────────────────────────────
 _API_CONFIG_PATH = SKILL_DIR / ".api_config.json"
 
@@ -175,6 +182,231 @@ def extract_json_from_text(text):
 
 # ─── Step 1: 下载 ────────────────────────────────────────────────────────────
 
+def _ensure_ytdlp():
+    """确保 yt-dlp 可用"""
+    try:
+        run_cmd(["yt-dlp", "--version"])
+    except (FileNotFoundError, RuntimeError):
+        log("yt-dlp 未安装，尝试安装...", "WARN")
+        run_cmd([sys.executable, "-m", "pip", "install", "--break-system-packages", "yt-dlp"], check=False)
+
+
+def _find_output_file(output_dir, output_path):
+    """查找 yt-dlp 实际输出文件（可能改变扩展名）"""
+    if os.path.exists(output_path):
+        return output_path
+    for f in os.listdir(output_dir):
+        if f.startswith("downloaded_video"):
+            return os.path.join(output_dir, f)
+    return None
+
+
+def _ytdlp_download(url, output_path, extra_args=None, strategy_name="default"):
+    """尝试用 yt-dlp 下载，返回 (success, error_msg/filepath)"""
+    # 清理可能的残留文件
+    for f in os.listdir(os.path.dirname(output_path)):
+        if f.startswith("downloaded_video"):
+            os.remove(os.path.join(os.path.dirname(output_path), f))
+
+    # 检查 extra_args 是否包含自定义格式选择
+    has_custom_format = extra_args and "-f" in extra_args
+
+    cmd = ["yt-dlp"]
+    if not has_custom_format:
+        cmd += ["-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best"]
+    cmd += [
+        "--merge-output-format", "mp4",
+        "-o", output_path,
+        "--no-playlist",
+        "--socket-timeout", "30",
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(url)
+
+    log(f"YouTube 策略 [{strategy_name}]: 开始下载...")
+    try:
+        result = run_cmd(cmd, check=False)
+        if result.returncode == 0:
+            found = _find_output_file(os.path.dirname(output_path), output_path)
+            if found:
+                log(f"策略 [{strategy_name}] 成功: {get_file_size(found) / 1024 / 1024:.1f}MB")
+                return True, found
+            return False, "下载完成但找不到输出文件"
+
+        stderr = result.stderr or ""
+        stdout = result.stdout or ""
+        combined = stderr + stdout
+        # 检查是否仅格式不可用（可能是 SABR / PO Token 问题）
+        if "Requested format is not available" in combined:
+            return False, "格式不可用 (可能 SABR/PO Token 限制)"
+        if "412" in combined or "403" in combined or "HTTP Error" in combined:
+            return False, f"被反爬 ({combined[:200]})"
+        if "Only images are available" in combined:
+            return False, "仅有缩略图可用，视频格式被限制"
+        return False, f"exit {result.returncode}: {stderr[:300]}"
+    except FileNotFoundError:
+        return False, "yt-dlp 不可用"
+
+
+def _find_youtube_cookies():
+    """查找用户提供的 YouTube cookie 文件"""
+    candidates = [
+        os.environ.get("YOUTUBE_COOKIES", ""),
+        os.path.expanduser("~/.claude/skills/video-learn/.yt_cookies.txt"),
+        "/tmp/yt_cookies.txt",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            log(f"找到 YouTube cookie 文件: {path}")
+            return path
+    return None
+
+
+def _extract_youtube_cookies_via_playwright(url):
+    """使用 Playwright 浏览器访问 YouTube 并导出 cookie（含 httpOnly）"""
+    cookie_file = "/tmp/yt_playwright_cookies.txt"
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("Playwright 未安装，跳过浏览器 cookie 提取", "WARN")
+        return None
+
+    log("使用 Playwright 浏览器获取 YouTube cookies...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            import time
+            time.sleep(3)
+
+            cookies = context.cookies()
+            if not cookies:
+                log("浏览器未获取到 cookies", "WARN")
+                browser.close()
+                return None
+
+            with open(cookie_file, "w") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                for c in cookies:
+                    domain = c.get("domain", "")
+                    flag = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = c.get("path", "/")
+                    secure = "TRUE" if c.get("secure", False) else "FALSE"
+                    expires = int(c.get("expires", 0))
+                    if expires < 0:
+                        expires = 0
+                    name = c.get("name", "")
+                    value = c.get("value", "")
+                    f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+            log(f"提取到 {len(cookies)} 个 cookies，保存到 {cookie_file}")
+            browser.close()
+            return cookie_file
+    except Exception as e:
+        log(f"Playwright cookie 提取失败: {e}", "WARN")
+        return None
+
+
+def _download_youtube(url, output_dir, output_path):
+    """
+    YouTube 多策略下载：
+    1. node JS runtime + 标准格式 (720p)
+    2. node JS runtime + 降级格式 (480p)
+    3. 合并格式 (format 18, 360p)
+    4. 不同 player client (mweb)
+    5. android vr fallback
+    6. 用户提供的 cookies
+    7. Playwright 浏览器 cookies
+    """
+    # 检查是否有用户提供的 cookie 文件
+    cookie_file = _find_youtube_cookies()
+    cookie_args = ["--cookies", cookie_file] if cookie_file else []
+
+    strategies = [
+        {
+            "name": "node-720p",
+            "args": ["--js-runtimes", "node"] + cookie_args,
+        },
+        {
+            "name": "node-480p",
+            "args": ["--js-runtimes", "node",
+                     "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best"] + cookie_args,
+        },
+        {
+            "name": "combined-360p",
+            "args": ["--js-runtimes", "node",
+                     "-f", "18/best[height<=480]"] + cookie_args,
+        },
+        {
+            "name": "mweb-client",
+            "args": ["--js-runtimes", "node",
+                     "--extractor-args", "youtube:player_client=mweb",
+                     "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best"] + cookie_args,
+        },
+        {
+            "name": "android-vr-fallback",
+            "args": ["-f", "18/best[height<=480]"] + cookie_args,
+        },
+    ]
+
+    errors = []
+    is_bot_detected = False
+
+    for strat in strategies:
+        ok, result = _ytdlp_download(url, output_path, list(strat["args"]), strat["name"])
+        if ok:
+            return result
+        log(f"策略 [{strat['name']}] 失败: {result}", "WARN")
+        errors.append(f"[{strat['name']}] {result}")
+        if "not a bot" in result.lower() or "sign in" in result.lower():
+            is_bot_detected = True
+
+    # 如果是 bot 检测导致失败，且没有 cookie 文件，尝试 Playwright
+    if is_bot_detected and not cookie_file:
+        log("检测到 YouTube bot 拦截，尝试使用 Playwright 获取 cookies...", "WARN")
+        pw_cookies = _extract_youtube_cookies_via_playwright(url)
+        if pw_cookies:
+            pw_cookie_args = ["--cookies", pw_cookies]
+            pw_strategies = [
+                {
+                    "name": "playwright-cookies-720p",
+                    "args": ["--js-runtimes", "node"] + pw_cookie_args,
+                },
+                {
+                    "name": "playwright-cookies-360p",
+                    "args": ["--js-runtimes", "node",
+                             "-f", "18/best[height<=480]"] + pw_cookie_args,
+                },
+            ]
+            for strat in pw_strategies:
+                ok, result = _ytdlp_download(url, output_path, list(strat["args"]), strat["name"])
+                if ok:
+                    return result
+                log(f"策略 [{strat['name']}] 失败: {result}", "WARN")
+                errors.append(f"[{strat['name']}] {result}")
+
+    # 所有策略失败
+    total = len(errors)
+    log(f"YouTube 所有 {total} 个下载策略均失败", "ERROR")
+
+    if is_bot_detected:
+        log("=" * 60, "ERROR")
+        log("YouTube 检测到 bot 并拦截了下载请求。", "ERROR")
+        log("将尝试字幕/转录 fallback 进行纯文本分析。", "ERROR")
+        log("=" * 60, "ERROR")
+
+    raise YouTubeDownloadError(
+        f"YouTube 所有 {total} 个下载策略均失败: {'; '.join(errors[:3])}",
+        is_bot_detected=is_bot_detected
+    )
+
+
 def download_video(url, output_dir=None):
     """下载视频，返回本地文件路径"""
     if os.path.isfile(url):
@@ -193,54 +425,399 @@ def download_video(url, output_dir=None):
 
     output_path = os.path.join(output_dir, "downloaded_video.mp4")
 
-    # 检查 yt-dlp 是否可用
-    try:
-        run_cmd(["yt-dlp", "--version"])
-    except (FileNotFoundError, RuntimeError):
-        log("yt-dlp 未安装，尝试安装...", "WARN")
-        run_cmd([sys.executable, "-m", "pip", "install", "yt-dlp"], check=False)
+    _ensure_ytdlp()
 
-    cmd = [
-        "yt-dlp",
-        "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "--merge-output-format", "mp4",
-        "-o", output_path,
-        "--no-playlist",
-        "--socket-timeout", "30",
-        url
+    # YouTube 使用多策略下载
+    if platform == "youtube":
+        return _download_youtube(url, output_dir, output_path)
+
+    # 其他平台（Bilibili 等）使用标准 yt-dlp
+    ok, result = _ytdlp_download(url, output_path, ["--js-runtimes", "node"], "standard")
+    if ok:
+        return result
+
+    log(f"yt-dlp 下载失败，需使用浏览器 fallback", "WARN")
+    sys.exit(2)
+
+
+# ─── YouTube 字幕/转录 Fallback ──────────────────────────────────────────────
+
+def _parse_vtt(vtt_file):
+    """解析 VTT 字幕文件为 [{start: float, text: str}] 列表"""
+    content = Path(vtt_file).read_text(encoding="utf-8")
+    lines = content.split('\n')
+    transcript = []
+    seen_texts = set()  # 去重（auto-sub 常有大量重复行）
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if '-->' in line:
+            parts = line.split('-->')
+            start_time = parts[0].strip()
+            time_parts = start_time.replace(',', '.').split(':')
+            if len(time_parts) == 3:
+                h, m, s = time_parts
+                start_seconds = int(h) * 3600 + int(m) * 60 + float(s.split('.')[0])
+            elif len(time_parts) == 2:
+                m, s = time_parts
+                start_seconds = int(m) * 60 + float(s.split('.')[0])
+            else:
+                start_seconds = 0
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip() and '-->' not in lines[i]:
+                text = lines[i].strip()
+                # 跳过 VTT 标签和纯数字行
+                if not text.isdigit():
+                    # 移除 HTML/VTT 标签
+                    import re as _re
+                    clean = _re.sub(r'<[^>]+>', '', text)
+                    if clean.strip():
+                        text_lines.append(clean.strip())
+                i += 1
+            full_text = ' '.join(text_lines)
+            if full_text and full_text not in seen_texts:
+                seen_texts.add(full_text)
+                transcript.append({"start": start_seconds, "text": full_text})
+        else:
+            i += 1
+    return transcript
+
+
+def _format_transcript(transcript):
+    """格式化转录列表为带时间戳的文本"""
+    lines = []
+    for entry in transcript:
+        start = int(entry["start"])
+        mins, secs = divmod(start, 60)
+        lines.append(f"[{mins:02d}:{secs:02d}] {entry['text']}")
+    return "\n".join(lines)
+
+
+def _browser_extract_transcript(url, video_id):
+    """
+    使用浏览器直接从 YouTube 页面提取字幕。
+    YouTube 页面的 ytInitialPlayerResponse 中包含字幕轨道 URL，
+    可以直接请求字幕 XML/JSON 而无需通过 yt-dlp。
+    """
+    try:
+        # 尝试通过 YouTube 的 timedtext API 获取字幕
+        # 这个 API 不需要完整的视频解密，只需要 video_id
+        import urllib.parse
+        timedtext_url = (
+            f"https://www.youtube.com/api/timedtext?v={video_id}"
+            f"&lang=en&fmt=json3"
+        )
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        req = urllib.request.Request(timedtext_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                events = data.get("events", [])
+                transcript = []
+                for event in events:
+                    segs = event.get("segs", [])
+                    if not segs:
+                        continue
+                    text = "".join(s.get("utf8", "") for s in segs).strip()
+                    if text:
+                        start_ms = event.get("tStartMs", 0)
+                        transcript.append({
+                            "start": start_ms / 1000.0,
+                            "text": text
+                        })
+                if transcript:
+                    log(f"YouTube timedtext API 获取成功: {len(transcript)} 条")
+                    return transcript
+        except Exception as e:
+            log(f"YouTube timedtext API 失败: {e}", "WARN")
+
+        # Fallback: 尝试自动生成字幕
+        auto_url = (
+            f"https://www.youtube.com/api/timedtext?v={video_id}"
+            f"&lang=en&kind=asr&fmt=json3"
+        )
+        req = urllib.request.Request(auto_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                events = data.get("events", [])
+                transcript = []
+                for event in events:
+                    segs = event.get("segs", [])
+                    if not segs:
+                        continue
+                    text = "".join(s.get("utf8", "") for s in segs).strip()
+                    if text:
+                        start_ms = event.get("tStartMs", 0)
+                        transcript.append({
+                            "start": start_ms / 1000.0,
+                            "text": text
+                        })
+                if transcript:
+                    log(f"YouTube auto-caption API 获取成功: {len(transcript)} 条")
+                    return transcript
+        except Exception as e:
+            log(f"YouTube auto-caption API 失败: {e}", "WARN")
+
+    except Exception as e:
+        log(f"浏览器字幕提取异常: {e}", "WARN")
+
+    return None
+
+
+def download_youtube_transcript(url, output_dir=None):
+    """
+    使用 yt-dlp 下载 YouTube 字幕（不下载视频）。
+    参考 youtube-ai-digest 的方案。
+    返回 (formatted_text, language, raw_transcript) 或 (None, None, None)
+    """
+    if output_dir is None:
+        output_dir = tempfile.mkdtemp(prefix="yt_transcript_")
+    os.makedirs(output_dir, exist_ok=True)
+
+    _ensure_ytdlp()
+
+    # 提取 video_id
+    video_id = None
+    import re as _re
+    m = _re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+    if m:
+        video_id = m.group(1)
+    else:
+        video_id = hashlib.md5(url.encode()).hexdigest()[:11]
+
+    output_template = os.path.join(output_dir, f"sub_{video_id}")
+
+    log("尝试下载 YouTube 字幕（不下载视频）...")
+
+    # 检查是否有 cookie 文件
+    cookie_file = _find_youtube_cookies()
+    cookie_args = ["--cookies", cookie_file] if cookie_file else []
+
+    # 尝试多种字幕语言和策略
+    strategies = [
+        {
+            "name": "node-auto-sub-en-zh",
+            "args": [
+                "yt-dlp", "--js-runtimes", "node",
+                "--skip-download",
+                "--write-auto-sub", "--write-sub",
+                "--sub-lang", "en,zh-Hans,zh,ja",
+                "--sub-format", "vtt",
+                "-o", output_template,
+            ] + cookie_args + [url]
+        },
+        {
+            "name": "node-auto-sub-all",
+            "args": [
+                "yt-dlp", "--js-runtimes", "node",
+                "--skip-download",
+                "--write-auto-sub",
+                "--sub-format", "vtt",
+                "-o", output_template,
+            ] + cookie_args + [url]
+        },
+        {
+            "name": "mweb-auto-sub",
+            "args": [
+                "yt-dlp", "--js-runtimes", "node",
+                "--extractor-args", "youtube:player_client=mweb",
+                "--skip-download",
+                "--write-auto-sub", "--write-sub",
+                "--sub-lang", "en,zh-Hans,zh,ja",
+                "--sub-format", "vtt",
+                "-o", output_template,
+            ] + cookie_args + [url]
+        },
+        {
+            "name": "no-js-auto-sub",
+            "args": [
+                "yt-dlp", "--skip-download",
+                "--write-auto-sub", "--write-sub",
+                "--sub-lang", "en,zh-Hans,zh,ja",
+                "--sub-format", "vtt",
+                "-o", output_template,
+            ] + cookie_args + [url]
+        },
     ]
 
-    try:
-        result = run_cmd(cmd, check=False)
-        if result.returncode != 0:
-            stderr = result.stderr or ""
-            if "412" in stderr or "403" in stderr or "HTTP Error" in stderr:
-                log(f"yt-dlp 被反爬 (可能412/403)，需使用浏览器 fallback", "WARN")
-                sys.exit(2)
-            raise RuntimeError(f"yt-dlp 下载失败: {stderr}")
-    except FileNotFoundError:
-        log("yt-dlp 不可用，需使用浏览器 fallback", "WARN")
-        sys.exit(2)
+    for strat in strategies:
+        log(f"字幕策略 [{strat['name']}]...")
+        result = subprocess.run(strat["args"], capture_output=True, text=True, timeout=60)
 
-    # yt-dlp 可能改变扩展名，查找实际文件
-    if not os.path.exists(output_path):
+        # 查找生成的 VTT 文件
+        for f in sorted(os.listdir(output_dir)):
+            if f.startswith(f"sub_{video_id}") and f.endswith(".vtt"):
+                vtt_path = os.path.join(output_dir, f)
+                transcript = _parse_vtt(vtt_path)
+                if transcript and len(transcript) >= 5:  # 至少5条才算有效
+                    # 提取语言
+                    lang = "unknown"
+                    for lang_code in ["en", "zh-Hans", "zh", "ja", "ko"]:
+                        if f".{lang_code}." in f:
+                            lang = lang_code
+                            break
+
+                    formatted = _format_transcript(transcript)
+                    log(f"字幕获取成功: {len(transcript)} 条, 语言={lang}")
+                    return formatted, lang, transcript
+
+        # 清理本轮可能产生的文件
         for f in os.listdir(output_dir):
-            if f.startswith("downloaded_video"):
-                output_path = os.path.join(output_dir, f)
-                break
+            if f.startswith(f"sub_{video_id}") and f.endswith(".vtt"):
+                os.remove(os.path.join(output_dir, f))
 
-    if not os.path.exists(output_path):
-        raise RuntimeError("下载完成但找不到输出文件")
+    # 最终 fallback: 使用 Playwright 浏览器提取字幕
+    log("yt-dlp 字幕策略均失败，尝试浏览器 fallback...", "WARN")
+    transcript = _browser_extract_transcript(url, video_id)
+    if transcript and len(transcript) >= 5:
+        formatted = _format_transcript(transcript)
+        log(f"浏览器字幕提取成功: {len(transcript)} 条")
+        return formatted, "en", transcript
 
-    log(f"下载完成: {output_path} ({get_file_size(output_path) / 1024 / 1024:.1f}MB)")
-    return output_path
+    log("所有字幕下载策略均失败（包括浏览器 fallback）", "ERROR")
+    return None, None, None
+
+
+def get_youtube_video_info(url):
+    """获取 YouTube 视频元信息（标题、时长等），不下载视频"""
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--dump-json", "--skip-download", "--no-playlist", url],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            info = json.loads(result.stdout.strip())
+            return {
+                "title": info.get("title", ""),
+                "duration": info.get("duration", 0),
+                "channel": info.get("uploader", "") or info.get("channel", ""),
+                "upload_date": info.get("upload_date", ""),
+                "view_count": info.get("view_count", 0),
+                "description": (info.get("description", "") or "")[:500],
+                "thumbnail": info.get("thumbnail", ""),
+            }
+    except Exception as e:
+        log(f"获取视频信息失败: {e}", "WARN")
+    return None
+
+
+def call_doubao_text_api(text_content, prompt_text, retry=MAX_RETRIES):
+    """调用豆包大模型 API（纯文本，无视频）"""
+    if not API_KEY:
+        raise RuntimeError(
+            "豆包 API Key 未配置。请先运行首次设置：\n"
+            "  方法1: 设置环境变量 DOUBAO_API_KEY=<your-key>\n"
+            "  方法2: 编辑 ~/.claude/skills/video-learn/.api_config.json"
+        )
+
+    # 将转录文本和 prompt 合并为一个文本输入
+    combined_text = f"{prompt_text}\n\n---\n\n以下是视频的完整转录/字幕文本：\n\n{text_content}"
+
+    payload = {
+        "model": API_MODEL,
+        "input": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": combined_text
+                }
+            ]
+        }]
+    }
+
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}"
+    }
+
+    req = urllib.request.Request(API_ENDPOINT, data=data, headers=headers, method="POST")
+
+    for attempt in range(1, retry + 1):
+        try:
+            log(f"API 文本分析调用 (尝试 {attempt}/{retry})...")
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                body = resp.read().decode("utf-8")
+                result = json.loads(body)
+                return parse_api_response(result)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            log(f"API HTTP 错误 {e.code}: {body[:500]}", "ERROR")
+            if attempt < retry:
+                time.sleep(5 * attempt)
+        except urllib.error.URLError as e:
+            log(f"API 网络错误: {e}", "ERROR")
+            if attempt < retry:
+                time.sleep(5 * attempt)
+        except Exception as e:
+            log(f"API 未知错误: {e}", "ERROR")
+            if attempt < retry:
+                time.sleep(5 * attempt)
+
+    raise RuntimeError(f"API 文本分析调用在 {retry} 次重试后失败")
 
 
 # ─── Step 2: 压缩 ────────────────────────────────────────────────────────────
 
+def _get_compression_tier(duration):
+    """根据视频时长决定压缩策略"""
+    if duration <= 300:  # ≤5min
+        return {
+            "label": "短视频",
+            "scale": "min(1280,iw):-2",
+            "fps": None,  # 保持原始帧率
+            "audio_bitrate": 96,
+            "audio_channels": 2,
+            "audio_rate": None,
+            "crf": 28,
+            "preset": "fast",
+        }
+    elif duration <= 900:  # 5-15min
+        return {
+            "label": "中等时长",
+            "scale": "min(960,iw):-2",
+            "fps": 24,
+            "audio_bitrate": 64,
+            "audio_channels": 1,
+            "audio_rate": 44100,
+            "crf": 30,
+            "preset": "fast",
+        }
+    elif duration <= 1800:  # 15-30min
+        return {
+            "label": "长视频",
+            "scale": "min(640,iw):-2",
+            "fps": 15,
+            "audio_bitrate": 48,
+            "audio_channels": 1,
+            "audio_rate": 32000,
+            "crf": 32,
+            "preset": "medium",
+        }
+    else:  # >30min
+        return {
+            "label": "超长视频",
+            "scale": "min(480,iw):-2",
+            "fps": 10,
+            "audio_bitrate": 32,
+            "audio_channels": 1,
+            "audio_rate": 24000,
+            "crf": 34,
+            "preset": "medium",
+        }
+
+
 def compress_video(input_path, output_path=None, target_size=TARGET_FILE_SIZE):
     """
     压缩视频到目标大小。
+    根据视频时长自动选择压缩策略：短视频保持高质量，长视频降低分辨率/帧率。
     如果原始文件已够小，只做 faststart 处理。
     """
     if output_path is None:
@@ -267,50 +844,103 @@ def compress_video(input_path, output_path=None, target_size=TARGET_FILE_SIZE):
         duration = 60.0
         log("无法获取时长，假设 60 秒", "WARN")
 
-    def do_compress(tgt_size):
+    tier = _get_compression_tier(duration)
+    log(f"视频时长 {duration:.0f}s，使用「{tier['label']}」压缩策略")
+
+    def do_compress(tgt_size, src_path, compression_tier):
         target_bitrate_kbps = int((tgt_size * 8) / duration / 1024 * 0.9)
-        target_bitrate_kbps = max(target_bitrate_kbps, 200)
-        audio_bitrate = 96
-        video_bitrate = target_bitrate_kbps - audio_bitrate
+        target_bitrate_kbps = max(target_bitrate_kbps, 100)
+        audio_bitrate = compression_tier["audio_bitrate"]
+        video_bitrate = max(target_bitrate_kbps - audio_bitrate, 50)
 
         log(f"目标码率: {video_bitrate}k video + {audio_bitrate}k audio (时长 {duration:.0f}s)")
 
+        # 构建 video filter
+        vf_parts = [f"scale={compression_tier['scale']}:force_original_aspect_ratio=decrease"]
+        if compression_tier["fps"]:
+            vf_parts.append(f"fps={compression_tier['fps']}")
+        vf_str = ",".join(vf_parts)
+
         tmp_out = output_path + ".tmp.mp4"
         cmd = [
-            "ffmpeg", "-y", "-i", input_path,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "28",
-            "-b:v", f"{video_bitrate}k", "-maxrate", f"{int(video_bitrate * 1.5)}k",
+            "ffmpeg", "-y", "-i", src_path,
+            "-c:v", "libx264",
+            "-preset", compression_tier["preset"],
+            "-crf", str(compression_tier["crf"]),
+            "-b:v", f"{video_bitrate}k",
+            "-maxrate", f"{int(video_bitrate * 1.5)}k",
             "-bufsize", f"{video_bitrate * 2}k",
-            "-vf", "scale='min(1280,iw)':min'(720,ih)':force_original_aspect_ratio=decrease",
+            "-vf", vf_str,
             "-c:a", "aac", "-b:a", f"{audio_bitrate}k",
-            "-movflags", "+faststart",
-            tmp_out
+            "-ac", str(compression_tier["audio_channels"]),
         ]
+        if compression_tier["audio_rate"]:
+            cmd += ["-ar", str(compression_tier["audio_rate"])]
+        cmd += ["-movflags", "+faststart", tmp_out]
+
         run_cmd(cmd)
         os.rename(tmp_out, output_path)
         return output_path
 
-    # 第一次压缩
-    do_compress(target_size)
+    # 第一次压缩（按时长选择的策略）
+    do_compress(target_size, input_path, tier)
     result_b64_size = base64_size(output_path)
     result_fsize = get_file_size(output_path)
     log(f"压缩结果: {result_fsize / 1024 / 1024:.1f}MB (base64 ≈ {result_b64_size / 1024 / 1024:.1f}MB)")
 
-    # 如果仍超限，二次压缩
+    # 如果仍超限，使用更激进的策略二次压缩
     if result_b64_size > MAX_BASE64_BYTES:
-        log("base64 仍超限，执行二次压缩", "WARN")
-        second_target = int(target_size * 0.6)
-        backup = input_path
-        input_path = output_path
-        do_compress(second_target)
+        log("base64 仍超限，升级到更激进压缩策略", "WARN")
+        # 升级到更高的压缩层级
+        aggressive_tier = _get_compression_tier(duration + 1800)  # 强制升一级
+        aggressive_tier["crf"] = min(aggressive_tier["crf"] + 2, 38)
+        log(f"二次压缩使用「{aggressive_tier['label']}+」策略")
+        do_compress(int(target_size * 0.5), output_path, aggressive_tier)
         result_b64_size = base64_size(output_path)
         result_fsize = get_file_size(output_path)
         log(f"二次压缩结果: {result_fsize / 1024 / 1024:.1f}MB (base64 ≈ {result_b64_size / 1024 / 1024:.1f}MB)")
 
+        # 如果还是超限，终极压缩：最低画质
         if result_b64_size > MAX_BASE64_BYTES:
-            log("二次压缩后仍超限，视频可能过长", "ERROR")
+            log("仍然超限，执行终极压缩 (320p, 8fps, 24k audio)", "WARN")
+            ultra_tier = {
+                "label": "终极压缩",
+                "scale": "min(320,iw):-2",
+                "fps": 8,
+                "audio_bitrate": 24,
+                "audio_channels": 1,
+                "audio_rate": 16000,
+                "crf": 38,
+                "preset": "slow",
+            }
+            do_compress(int(target_size * 0.35), output_path, ultra_tier)
+            result_b64_size = base64_size(output_path)
+            result_fsize = get_file_size(output_path)
+            log(f"终极压缩结果: {result_fsize / 1024 / 1024:.1f}MB (base64 ≈ {result_b64_size / 1024 / 1024:.1f}MB)")
+
+            if result_b64_size > MAX_BASE64_BYTES:
+                log("终极压缩后仍超限，需要裁剪视频", "ERROR")
 
     return output_path
+
+
+def trim_video(input_path, output_path, max_duration_sec):
+    """裁剪视频到指定最大时长（秒），用于超长视频无法压缩到API限制时的降级方案"""
+    duration = get_video_duration(input_path)
+    if duration <= max_duration_sec:
+        log(f"视频时长 {duration:.0f}s <= {max_duration_sec}s，无需裁剪")
+        return input_path, False
+
+    log(f"裁剪视频: {duration:.0f}s -> {max_duration_sec}s")
+    run_cmd([
+        "ffmpeg", "-y", "-i", input_path,
+        "-t", str(max_duration_sec),
+        "-c", "copy", "-movflags", "+faststart",
+        output_path
+    ])
+    trimmed_duration = get_video_duration(output_path)
+    log(f"裁剪完成: {trimmed_duration:.0f}s ({get_file_size(output_path) / 1024 / 1024:.1f}MB)")
+    return output_path, True
 
 
 # ─── Step 3 & 4: API 分析 ─────────────────────────────────────────────────────
