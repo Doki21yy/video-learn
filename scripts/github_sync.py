@@ -198,8 +198,21 @@ def extract_thumbnail(meta_json_path, output_jpg_path):
 # ─── Platform Detection ───────────────────────────────────────────────────────
 
 def detect_platform(analysis_data, meta_data, slug):
-    """Detect the video platform from available data."""
-    # Check analysis for platform_fit
+    """Detect the video platform from source URL or analysis data."""
+    # Primary: check source_url
+    source_url = (analysis_data.get("_meta", {}).get("source_url", "")
+                  or meta_data.get("source_url", "")).lower()
+    if source_url:
+        if "bilibili" in source_url:
+            return "Bilibili"
+        if "youtube" in source_url or "youtu.be" in source_url:
+            return "YouTube"
+        if "xiaohongshu" in source_url or "xhslink" in source_url:
+            return "Xiaohongshu"
+        if "douyin" in source_url:
+            return "Douyin"
+
+    # Fallback: check analysis platform_fit (video-optimize style)
     algo = analysis_data.get("algorithm_fitness", {})
     fits = algo.get("platform_fit", [])
     for fit in fits:
@@ -214,11 +227,7 @@ def detect_platform(analysis_data, meta_data, slug):
             if "小红书" in p:
                 return "Xiaohongshu"
 
-    # Check meta title language
-    title = meta_data.get("title", "")
-    if any(ord(c) > 0x4e00 for c in title):
-        return "Bilibili"  # Chinese title likely B站
-    return "YouTube"  # Default for English titles
+    return "Unknown"
 
 
 def detect_source_url(analysis_data):
@@ -248,80 +257,15 @@ def _extract_bilibili_bvid(url):
     return m.group(1) if m else None
 
 
-def _build_video_embed(source_url, report_dir):
-    """Build an embedded video player HTML for the report page.
-    YouTube/Bilibili: iframe embed. Others: thumbnail + link to original."""
-    if not source_url:
-        # No source URL -- show thumbnail from frames
-        return _build_thumbnail_fallback(source_url, report_dir)
-
-    # YouTube embed
-    yt_id = _extract_youtube_id(source_url)
-    if yt_id:
-        return f'''<div style="background:#0a0a1a;border-radius:8px;overflow:hidden">
-            <div style="position:relative;padding-top:56.25%">
-                <iframe src="https://www.youtube.com/embed/{yt_id}" frameborder="0"
-                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
-                    allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;border-radius:8px"></iframe>
-            </div>
-            <div style="padding:8px 12px;text-align:right">
-                <a href="{source_url}" target="_blank" style="color:#a78bfa;text-decoration:none;font-size:0.8rem">Open on YouTube &rarr;</a>
-            </div>
-        </div>'''
-
-    # Bilibili embed
-    bvid = _extract_bilibili_bvid(source_url)
-    if bvid:
-        return f'''<div style="background:#0a0a1a;border-radius:8px;overflow:hidden">
-            <div style="position:relative;padding-top:56.25%">
-                <iframe src="//player.bilibili.com/player.html?bvid={bvid}&high_quality=1&danmaku=0" frameborder="0"
-                    allowfullscreen scrolling="no" style="position:absolute;top:0;left:0;width:100%;height:100%;border-radius:8px"></iframe>
-            </div>
-            <div style="padding:8px 12px;text-align:right">
-                <a href="{source_url}" target="_blank" style="color:#00a1d6;text-decoration:none;font-size:0.8rem">Open on Bilibili &rarr;</a>
-            </div>
-        </div>'''
-
-    # Other platforms: thumbnail + clickable link
-    return _build_thumbnail_fallback(source_url, report_dir)
-
-
-def _build_thumbnail_fallback(source_url, report_dir):
-    """Fallback: show thumbnail image + link to original video."""
-    thumb_html = ""
-    analysis_path = os.path.join(report_dir, "analysis.json")
-    if os.path.isfile(analysis_path):
-        with open(analysis_path, "r") as f:
-            analysis = json.load(f)
-        frames = analysis.get("_frames", [])
-        if frames:
-            thumb_html = f'<img src="data:image/jpeg;base64,{frames[0]["base64"]}" style="width:100%;border-radius:8px;cursor:pointer" />'
-
-    link_html = ""
-    if source_url:
-        link_html = f'<a href="{source_url}" target="_blank" style="display:inline-block;margin-top:8px;color:#a78bfa;text-decoration:none;font-size:0.85rem">Watch original video &rarr;</a>'
-
-    if source_url and thumb_html:
-        thumb_html = f'<a href="{source_url}" target="_blank">{thumb_html}</a>'
-
-    return f'''<div style="background:#0a0a1a;border-radius:8px;padding:16px;text-align:center">
-            {thumb_html or '<div style="width:100%;padding:30% 0;color:#666">No preview available</div>'}
-            {link_html}
-        </div>'''
 
 
 # ─── Report-GH Generation ─────────────────────────────────────────────────────
 
-def _detect_report_type(html):
-    """Detect whether the report is 'learning' or 'optimize' type."""
-    if 'id="vp"' in html or '视频学习笔记' in html or 'video-learn' in html:
-        return "learning"
-    return "optimize"
-
 
 def generate_report_gh(report_dir, source_url="", dashboard_url="../../../"):
-    """Generate a GitHub-friendly report HTML (no video embed, Chart.js inlined).
-    Generates learning report from analysis data."""
+    """Generate a GitHub-friendly report HTML from report-lite.html.
+    The new dark theme report is already self-contained, just needs
+    the back-nav link updated to point to the dashboard."""
     lite_path = os.path.join(report_dir, "report-lite.html")
     if not os.path.isfile(lite_path):
         return None
@@ -329,90 +273,8 @@ def generate_report_gh(report_dir, source_url="", dashboard_url="../../../"):
     with open(lite_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    report_type = _detect_report_type(html)
-
-    # Inline Chart.js (only needed for optimize reports)
-    if report_type == "optimize":
-        chartjs_path = os.path.join(SCRIPT_DIR, "chart.umd.min.js")
-        if not os.path.isfile(chartjs_path):
-            try:
-                url = "https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    chartjs = resp.read().decode("utf-8")
-                with open(chartjs_path, "w") as f:
-                    f.write(chartjs)
-            except Exception:
-                chartjs = ""
-        else:
-            with open(chartjs_path, "r") as f:
-                chartjs = f.read()
-
-        if chartjs:
-            html = html.replace(
-                '<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>',
-                f'<script>{chartjs}</script>'
-            )
-
-    # Replace video player with embedded player or thumbnail + link
-    embed_html = _build_video_embed(source_url, report_dir)
-
-    if report_type == "learning":
-        # Learning report: video id="vp", inside .player-wrap
-        video_replacement = f'''<div style="position:relative;border-radius:14px;overflow:hidden">
-            {embed_html}
-        </div>'''
-        html = re.sub(
-            r'<video id="vp"[^>]*>.*?</video>',
-            video_replacement,
-            html,
-            flags=re.DOTALL
-        )
-
-        # Add navigation bar for learning report (light theme)
-        nav_bar = f'''<div style="background:#EDEBE4;padding:10px 20px;margin-bottom:12px;border-radius:10px;display:flex;align-items:center;gap:12px">
-    <a href="{dashboard_url}" style="color:#6C63FF;text-decoration:none;font-size:0.9rem">&larr; Back to Dashboard</a>
-    <span style="color:#B5B0A6">|</span>
-    <span style="color:#8A857D;font-size:0.8rem">Video Learning Library</span>
-</div>'''
-        html = html.replace('<div class="page">', f'<div class="page">\n{nav_bar}')
-
-        # Remove video sync script (references vp)
-        html = re.sub(
-            r"const vp=document\.getElementById\('vp'\);.*?(?=document\.querySelectorAll\('\.acc-head'\))",
-            "// Video sync disabled in GitHub version\n",
-            html,
-            flags=re.DOTALL
-        )
-        # Remove seekTo calls from onclick
-        html = re.sub(r'function seekTo\(t\)\{[^}]+\}', 'function seekTo(t){}', html)
-    else:
-        # Optimize report: video id="videoPlayer"
-        video_replacement = f'''    <div style="flex:1;max-width:60%;position:relative">
-        {embed_html}
-    </div>'''
-        html = re.sub(
-            r'<video id="videoPlayer"[^>]*>.*?</video>',
-            video_replacement,
-            html,
-            flags=re.DOTALL
-        )
-
-        # Add navigation bar (dark theme)
-        nav_bar = f'''<div style="background:#0f1729;padding:10px 20px;margin:-20px -20px 20px;border-radius:12px 12px 0 0;display:flex;align-items:center;gap:12px">
-    <a href="{dashboard_url}" style="color:#a78bfa;text-decoration:none;font-size:0.9rem">&larr; Back to Dashboard</a>
-    <span style="color:#444">|</span>
-    <span style="color:#666;font-size:0.8rem">Video Learning Library</span>
-</div>'''
-        html = html.replace('<div class="container">', f'<div class="container">\n{nav_bar}')
-
-        # Remove video sync script (references videoPlayer)
-        html = re.sub(
-            r'// ── 视频同步场景面板.*?(?=</script>)',
-            '// Scene panel (video sync disabled in GitHub version)\n',
-            html,
-            flags=re.DOTALL
-        )
+    # Update back-nav link to point to dashboard
+    html = html.replace('href="../../../"', f'href="{dashboard_url}"')
 
     return html
 
@@ -732,13 +594,10 @@ def setup(token=None, repo_name="Learningallthetime"):
 
     # 4. Push frontend files
     log("Pushing frontend files...")
-    from gh_frontend import generate_dashboard_html, generate_styles_css, generate_readme
+    from gh_frontend import generate_dashboard_html, generate_readme
 
     dashboard = generate_dashboard_html()
     api.upload_file("index.html", dashboard.encode("utf-8"), "Initial dashboard")
-
-    styles = generate_styles_css()
-    api.upload_file("assets/styles.css", styles.encode("utf-8"), "Initial styles")
 
     readme = generate_readme(owner, repo_name)
     api.upload_file("README.md", readme.encode("utf-8"), "Initial README")

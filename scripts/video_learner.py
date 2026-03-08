@@ -235,6 +235,16 @@ def analyze_video(video_path, title="", source_url=""):
     else:
         log("无法获取章节信息，跳过场景细拆", "WARN")
 
+    # 抽帧截图（用于封面和时间线）
+    log("抽取视频帧截图...")
+    tmp_frame_dir = tempfile.mkdtemp(prefix="vlearn_frames_")
+    frames = extract_frames(video_path, tmp_frame_dir)
+    if frames:
+        analysis["_frames"] = frames
+        log(f"抽帧完成: {len(frames)} 帧")
+    else:
+        log("抽帧失败，报告将不包含截图", "WARN")
+
     # 添加元数据
     analysis["_meta"] = {
         "title": title,
@@ -258,10 +268,10 @@ def generate_report(analysis_data, video_path, title, archive_dir):
     report_dir = os.path.join(archive_dir, f"{date_str}_{slug}")
     os.makedirs(report_dir, exist_ok=True)
 
-    # 保存分析 JSON
+    # 保存分析 JSON（保留 _frames 用于封面提取，排除 _video_base64）
     json_path = os.path.join(report_dir, "analysis.json")
     save_data = {k: v for k, v in analysis_data.items()
-                 if not k.startswith("_video_base64") and not k.startswith("_frames")}
+                 if not k.startswith("_video_base64")}
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(save_data, f, ensure_ascii=False, indent=2)
 
