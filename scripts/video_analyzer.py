@@ -175,6 +175,234 @@ def extract_json_from_text(text):
 
 # ─── Step 1: 下载 ────────────────────────────────────────────────────────────
 
+def _ensure_ytdlp():
+    """确保 yt-dlp 可用"""
+    try:
+        run_cmd(["yt-dlp", "--version"])
+    except (FileNotFoundError, RuntimeError):
+        log("yt-dlp 未安装，尝试安装...", "WARN")
+        run_cmd([sys.executable, "-m", "pip", "install", "--break-system-packages", "yt-dlp"], check=False)
+
+
+def _find_output_file(output_dir, output_path):
+    """查找 yt-dlp 实际输出文件（可能改变扩展名）"""
+    if os.path.exists(output_path):
+        return output_path
+    for f in os.listdir(output_dir):
+        if f.startswith("downloaded_video"):
+            return os.path.join(output_dir, f)
+    return None
+
+
+def _ytdlp_download(url, output_path, extra_args=None, strategy_name="default"):
+    """尝试用 yt-dlp 下载，返回 (success, error_msg/filepath)"""
+    # 清理可能的残留文件
+    for f in os.listdir(os.path.dirname(output_path)):
+        if f.startswith("downloaded_video"):
+            os.remove(os.path.join(os.path.dirname(output_path), f))
+
+    # 检查 extra_args 是否包含自定义格式选择
+    has_custom_format = extra_args and "-f" in extra_args
+
+    cmd = ["yt-dlp"]
+    if not has_custom_format:
+        cmd += ["-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best"]
+    cmd += [
+        "--merge-output-format", "mp4",
+        "-o", output_path,
+        "--no-playlist",
+        "--socket-timeout", "30",
+    ]
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(url)
+
+    log(f"YouTube 策略 [{strategy_name}]: 开始下载...")
+    try:
+        result = run_cmd(cmd, check=False)
+        if result.returncode == 0:
+            found = _find_output_file(os.path.dirname(output_path), output_path)
+            if found:
+                log(f"策略 [{strategy_name}] 成功: {get_file_size(found) / 1024 / 1024:.1f}MB")
+                return True, found
+            return False, "下载完成但找不到输出文件"
+
+        stderr = result.stderr or ""
+        stdout = result.stdout or ""
+        combined = stderr + stdout
+        # 检查是否仅格式不可用（可能是 SABR / PO Token 问题）
+        if "Requested format is not available" in combined:
+            return False, "格式不可用 (可能 SABR/PO Token 限制)"
+        if "412" in combined or "403" in combined or "HTTP Error" in combined:
+            return False, f"被反爬 ({combined[:200]})"
+        if "Only images are available" in combined:
+            return False, "仅有缩略图可用，视频格式被限制"
+        return False, f"exit {result.returncode}: {stderr[:300]}"
+    except FileNotFoundError:
+        return False, "yt-dlp 不可用"
+
+
+def _find_youtube_cookies():
+    """查找用户提供的 YouTube cookie 文件"""
+    candidates = [
+        os.environ.get("YOUTUBE_COOKIES", ""),
+        os.path.expanduser("~/.claude/skills/video-learn/.yt_cookies.txt"),
+        "/tmp/yt_cookies.txt",
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.path.getsize(path) > 0:
+            log(f"找到 YouTube cookie 文件: {path}")
+            return path
+    return None
+
+
+def _extract_youtube_cookies_via_playwright(url):
+    """使用 Playwright 浏览器访问 YouTube 并导出 cookie（含 httpOnly）"""
+    cookie_file = "/tmp/yt_playwright_cookies.txt"
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("Playwright 未安装，跳过浏览器 cookie 提取", "WARN")
+        return None
+
+    log("使用 Playwright 浏览器获取 YouTube cookies...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            import time
+            time.sleep(3)
+
+            cookies = context.cookies()
+            if not cookies:
+                log("浏览器未获取到 cookies", "WARN")
+                browser.close()
+                return None
+
+            with open(cookie_file, "w") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                for c in cookies:
+                    domain = c.get("domain", "")
+                    flag = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = c.get("path", "/")
+                    secure = "TRUE" if c.get("secure", False) else "FALSE"
+                    expires = int(c.get("expires", 0))
+                    if expires < 0:
+                        expires = 0
+                    name = c.get("name", "")
+                    value = c.get("value", "")
+                    f.write(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{name}\t{value}\n")
+
+            log(f"提取到 {len(cookies)} 个 cookies，保存到 {cookie_file}")
+            browser.close()
+            return cookie_file
+    except Exception as e:
+        log(f"Playwright cookie 提取失败: {e}", "WARN")
+        return None
+
+
+def _download_youtube(url, output_dir, output_path):
+    """
+    YouTube 多策略下载：
+    1. node JS runtime + 标准格式 (720p)
+    2. node JS runtime + 降级格式 (480p)
+    3. 合并格式 (format 18, 360p)
+    4. 不同 player client (mweb)
+    5. android vr fallback
+    6. 用户提供的 cookies
+    7. Playwright 浏览器 cookies
+    """
+    # 检查是否有用户提供的 cookie 文件
+    cookie_file = _find_youtube_cookies()
+    cookie_args = ["--cookies", cookie_file] if cookie_file else []
+
+    strategies = [
+        {
+            "name": "node-720p",
+            "args": ["--js-runtimes", "node"] + cookie_args,
+        },
+        {
+            "name": "node-480p",
+            "args": ["--js-runtimes", "node",
+                     "-f", "bestvideo[height<=480]+bestaudio/best[height<=480]/best"] + cookie_args,
+        },
+        {
+            "name": "combined-360p",
+            "args": ["--js-runtimes", "node",
+                     "-f", "18/best[height<=480]"] + cookie_args,
+        },
+        {
+            "name": "mweb-client",
+            "args": ["--js-runtimes", "node",
+                     "--extractor-args", "youtube:player_client=mweb",
+                     "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best"] + cookie_args,
+        },
+        {
+            "name": "android-vr-fallback",
+            "args": ["-f", "18/best[height<=480]"] + cookie_args,
+        },
+    ]
+
+    errors = []
+    is_bot_detected = False
+
+    for strat in strategies:
+        ok, result = _ytdlp_download(url, output_path, list(strat["args"]), strat["name"])
+        if ok:
+            return result
+        log(f"策略 [{strat['name']}] 失败: {result}", "WARN")
+        errors.append(f"[{strat['name']}] {result}")
+        if "not a bot" in result.lower() or "sign in" in result.lower():
+            is_bot_detected = True
+
+    # 如果是 bot 检测导致失败，且没有 cookie 文件，尝试 Playwright
+    if is_bot_detected and not cookie_file:
+        log("检测到 YouTube bot 拦截，尝试使用 Playwright 获取 cookies...", "WARN")
+        pw_cookies = _extract_youtube_cookies_via_playwright(url)
+        if pw_cookies:
+            pw_cookie_args = ["--cookies", pw_cookies]
+            pw_strategies = [
+                {
+                    "name": "playwright-cookies-720p",
+                    "args": ["--js-runtimes", "node"] + pw_cookie_args,
+                },
+                {
+                    "name": "playwright-cookies-360p",
+                    "args": ["--js-runtimes", "node",
+                             "-f", "18/best[height<=480]"] + pw_cookie_args,
+                },
+            ]
+            for strat in pw_strategies:
+                ok, result = _ytdlp_download(url, output_path, list(strat["args"]), strat["name"])
+                if ok:
+                    return result
+                log(f"策略 [{strat['name']}] 失败: {result}", "WARN")
+                errors.append(f"[{strat['name']}] {result}")
+
+    # 所有策略失败
+    total = len(errors)
+    log(f"YouTube 所有 {total} 个下载策略均失败", "ERROR")
+
+    if is_bot_detected:
+        log("=" * 60, "ERROR")
+        log("YouTube 检测到 bot 并拦截了下载请求。", "ERROR")
+        log("这通常发生在云服务器/数据中心 IP 上。", "ERROR")
+        log("解决方案：", "ERROR")
+        log("  1. 在本地设备下载视频后上传使用", "ERROR")
+        log("  2. 提供 YouTube cookie 文件:", "ERROR")
+        log("     export YOUTUBE_COOKIES=/path/to/cookies.txt", "ERROR")
+        log("     或放置到 ~/.claude/skills/video-learn/.yt_cookies.txt", "ERROR")
+        log("  3. 在浏览器中用 EditThisCookie 扩展导出 Netscape 格式 cookies", "ERROR")
+        log("=" * 60, "ERROR")
+
+    sys.exit(2)
+
+
 def download_video(url, output_dir=None):
     """下载视频，返回本地文件路径"""
     if os.path.isfile(url):
@@ -193,47 +421,19 @@ def download_video(url, output_dir=None):
 
     output_path = os.path.join(output_dir, "downloaded_video.mp4")
 
-    # 检查 yt-dlp 是否可用
-    try:
-        run_cmd(["yt-dlp", "--version"])
-    except (FileNotFoundError, RuntimeError):
-        log("yt-dlp 未安装，尝试安装...", "WARN")
-        run_cmd([sys.executable, "-m", "pip", "install", "yt-dlp"], check=False)
+    _ensure_ytdlp()
 
-    cmd = [
-        "yt-dlp",
-        "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
-        "--merge-output-format", "mp4",
-        "-o", output_path,
-        "--no-playlist",
-        "--socket-timeout", "30",
-        url
-    ]
+    # YouTube 使用多策略下载
+    if platform == "youtube":
+        return _download_youtube(url, output_dir, output_path)
 
-    try:
-        result = run_cmd(cmd, check=False)
-        if result.returncode != 0:
-            stderr = result.stderr or ""
-            if "412" in stderr or "403" in stderr or "HTTP Error" in stderr:
-                log(f"yt-dlp 被反爬 (可能412/403)，需使用浏览器 fallback", "WARN")
-                sys.exit(2)
-            raise RuntimeError(f"yt-dlp 下载失败: {stderr}")
-    except FileNotFoundError:
-        log("yt-dlp 不可用，需使用浏览器 fallback", "WARN")
-        sys.exit(2)
+    # 其他平台（Bilibili 等）使用标准 yt-dlp
+    ok, result = _ytdlp_download(url, output_path, ["--js-runtimes", "node"], "standard")
+    if ok:
+        return result
 
-    # yt-dlp 可能改变扩展名，查找实际文件
-    if not os.path.exists(output_path):
-        for f in os.listdir(output_dir):
-            if f.startswith("downloaded_video"):
-                output_path = os.path.join(output_dir, f)
-                break
-
-    if not os.path.exists(output_path):
-        raise RuntimeError("下载完成但找不到输出文件")
-
-    log(f"下载完成: {output_path} ({get_file_size(output_path) / 1024 / 1024:.1f}MB)")
-    return output_path
+    log(f"yt-dlp 下载失败，需使用浏览器 fallback", "WARN")
+    sys.exit(2)
 
 
 # ─── Step 2: 压缩 ────────────────────────────────────────────────────────────

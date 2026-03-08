@@ -49,30 +49,38 @@ ffmpeg -y -i /tmp/bili_video.m4s -i /tmp/bili_audio.m4s -c copy -movflags +fasts
 
 ## YouTube (youtube.com)
 
-### 重要：YouTube 优先使用 yt-dlp
+### 重要：YouTube 已内置多策略下载
 
-YouTube 的流地址使用 signatureCipher 加密，浏览器方案**无法直接提取可用 URL**。
-yt-dlp 内置了解密逻辑，是 YouTube 的首选方案。
+`download_video()` 对 YouTube 有 5 种自动重试策略，通常无需手动干预：
 
-如果 yt-dlp 报错 "No supported JavaScript runtime"，安装 deno：
-```bash
-curl -fsSL https://deno.land/install.sh | sh
-export PATH="$HOME/.deno/bin:$PATH"
-```
+1. **node-720p**: 使用 Node.js 解密签名，下载 720p
+2. **node-480p**: 降级到 480p
+3. **combined-360p**: 使用 format 18 (360p 合并格式)
+4. **mweb-client**: 切换到 mweb player client
+5. **android-vr-fallback**: 无 JS runtime 兜底，使用 android vr API
 
-然后重新运行 yt-dlp 下载即可。
+所有策略均使用 `--js-runtimes node` 启用 Node.js 进行 YouTube 签名解密（yt-dlp 默认只启用 deno）。
 
-### yt-dlp 下载命令
+### 如果所有策略仍然失败（exit code 2）
+
+1. 检查 yt-dlp 版本是否最新：
 ```bash
 export PATH="/home/node/.local/bin:$PATH"
-yt-dlp -f 'bestvideo[height<=720]+bestaudio/best[height<=720]/best' \
-  -o /tmp/yt_video.mp4 --no-playlist "<YouTube URL>"
+pip install --upgrade --break-system-packages yt-dlp
 ```
 
+2. 手动尝试下载：
+```bash
+export PATH="/home/node/.local/bin:$PATH"
+yt-dlp --js-runtimes node -f 18 -o /tmp/yt_video.mp4 --no-playlist "<YouTube URL>"
+```
+
+3. 如果报错 "Sign in to confirm your age"，该视频有年龄限制，无法无登录下载。
+
 ### 注意事项
-- yt-dlp 即使没有 JS runtime，也会使用 android vr API 作为 fallback，通常仍能下载
-- 如果遇到 "Sign in to confirm your age" 错误，该视频有年龄限制，无法无登录下载
 - 浏览器方案不可用（signatureCipher 加密），不要尝试从浏览器提取 URL
+- `--js-runtimes node` 是关键参数，yt-dlp 默认不启用 Node.js
+- YouTube 的 SABR (Server ABR) 需要签名解密，没有 JS runtime 会导致大部分格式不可用
 
 ---
 

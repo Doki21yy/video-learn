@@ -141,14 +141,26 @@ Step 5: 输出
 
 | 情况 | 处理 |
 |------|------|
-| yt-dlp 被反爬 (412/403) | 自动走 FALLBACK.md 浏览器方案 |
+| YouTube 反爬 (SABR/403) | 内置 5 种策略自动重试（node runtime + 多 player client） |
+| B站/小红书/抖音反爬 | 自动走 FALLBACK.md 浏览器方案 |
 | API 调用失败 | 内置 3 次重试；全部失败检查 Key |
-| 视频过大 (>50MB base64) | 自动二次压缩 |
+| 视频过大 (>50MB base64) | 自适应压缩（按时长分4级：720p/960p/640p/480p） |
+| 超长视频 (>30min) | 压缩失败时自动裁剪到前20分钟 |
+
+## YouTube 限制
+
+YouTube 在数据中心 IP 上有严格的 bot 检测。skill 内置了 5-7 种策略自动重试，但部分视频仍可能被拦截。
+
+遇到 "Sign in to confirm you're not a bot" 错误时：
+1. **推荐**：在本地电脑下载视频后上传，使用本地文件路径
+2. **高级**：导出 YouTube cookies（Netscape 格式）到 `~/.claude/skills/video-learn/.yt_cookies.txt`
+3. 或设置环境变量：`export YOUTUBE_COOKIES=/path/to/cookies.txt`
 
 ## 依赖
 
 - `python3`（标准库）
 - `ffmpeg` / `ffprobe`
 - `yt-dlp`（B站/YouTube）
+- `playwright`（可选，用于 YouTube cookie 提取）
 
 **运行前**：`export PATH="/home/node/.local/bin:$PATH"`
