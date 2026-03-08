@@ -49,48 +49,30 @@ ffmpeg -y -i /tmp/bili_video.m4s -i /tmp/bili_audio.m4s -c copy -movflags +fasts
 
 ## YouTube (youtube.com)
 
-### 流程
+### 重要：YouTube 优先使用 yt-dlp
 
-1. **打开页面**：
+YouTube 的流地址使用 signatureCipher 加密，浏览器方案**无法直接提取可用 URL**。
+yt-dlp 内置了解密逻辑，是 YouTube 的首选方案。
+
+如果 yt-dlp 报错 "No supported JavaScript runtime"，安装 deno：
 ```bash
-browser navigate "https://www.youtube.com/watch?v=xxxxxxxxxxx"
+curl -fsSL https://deno.land/install.sh | sh
+export PATH="$HOME/.deno/bin:$PATH"
 ```
 
-2. **提取流地址**：
+然后重新运行 yt-dlp 下载即可。
+
+### yt-dlp 下载命令
 ```bash
-browser console exec "JSON.stringify(ytInitialPlayerResponse.streamingData)"
-```
-
-从返回的 JSON 中提取：
-- 优先使用 `formats`（视频+音频合一流）：
-  - 找 `qualityLabel` 为 "720p" 或 "360p" 的条目
-  - 取其 `url` 字段
-- 如果 `formats` 没有可用的，使用 `adaptiveFormats`：
-  - 视频: `mimeType` 含 "video/mp4"，选 720p
-  - 音频: `mimeType` 含 "audio/mp4"，选码率最高的
-  - 分别下载后 ffmpeg 合并
-
-3. **下载**：
-
-合一流（formats 有 url）：
-```bash
-curl -L -o /tmp/yt_video.mp4 "<url>"
-```
-
-分离流（adaptiveFormats）：
-```bash
-curl -L -o /tmp/yt_video.mp4 "<video_url>"
-curl -L -o /tmp/yt_audio.m4a "<audio_url>"
-ffmpeg -y -i /tmp/yt_video.mp4 -i /tmp/yt_audio.m4a -c copy -movflags +faststart /tmp/yt_merged.mp4
+export PATH="/home/node/.local/bin:$PATH"
+yt-dlp -f 'bestvideo[height<=720]+bestaudio/best[height<=720]/best' \
+  -o /tmp/yt_video.mp4 --no-playlist "<YouTube URL>"
 ```
 
 ### 注意事项
-- YouTube 的 `formats` URL 可能包含 `&` 需要正确转义
-- 如果 `ytInitialPlayerResponse` 不存在，页面可能通过 AJAX 加载，尝试：
-  ```bash
-  browser console exec "document.querySelector('script:not([src])').textContent.match(/ytInitialPlayerResponse\\s*=\\s*(\\{.*?\\});/)?.[1]"
-  ```
-- 某些视频可能需要年龄验证或登录
+- yt-dlp 即使没有 JS runtime，也会使用 android vr API 作为 fallback，通常仍能下载
+- 如果遇到 "Sign in to confirm your age" 错误，该视频有年龄限制，无法无登录下载
+- 浏览器方案不可用（signatureCipher 加密），不要尝试从浏览器提取 URL
 
 ---
 
@@ -99,21 +81,45 @@ ffmpeg -y -i /tmp/yt_video.mp4 -i /tmp/yt_audio.m4a -c copy -movflags +faststart
 ### 流程（不使用 yt-dlp，直接浏览器方案）
 
 1. **打开页面**：
+
+> **重要**：小红书帖子页需要 `xsec_token` 参数才能正确加载。
+> 如果用户提供的链接不含此参数，先导航到 explore 页面获取带 token 的链接。
+
+如果链接已包含 `xsec_token`，直接打开：
 ```bash
-browser navigate "https://www.xiaohongshu.com/explore/xxxxxxx"
+browser navigate "https://www.xiaohongshu.com/explore/xxxxxxx?xsec_token=xxx&xsec_source="
 ```
 
-或者处理短链接：
+如果链接不含 `xsec_token`，先获取带 token 的链接：
+```bash
+# 先访问 explore 页关闭登录弹窗
+browser navigate "https://www.xiaohongshu.com/explore"
+browser act "Click the X close button on the login popup"
+# 从页面中提取带 token 的链接
+browser console exec "Array.from(document.querySelectorAll('a[href*=\"/explore/\"]')).find(a => a.href.includes('xsec_token'))?.href || 'NOT_FOUND'"
+```
+
+或者处理短链接（会自动重定向）：
 ```bash
 browser navigate "https://xhslink.com/xxxxxx"
 ```
 
-2. **提取视频地址**：
+2. **关闭登录弹窗**（页面加载后通常会弹出）：
 ```bash
-browser console exec "(() => { const state = window.__INITIAL_STATE__; const noteMap = state.note.noteDetailMap; const key = Object.keys(noteMap)[0]; const note = noteMap[key].note; const video = note.video; if (video && video.media && video.media.stream) { const streams = video.media.stream.h264 || video.media.stream.h265 || video.media.stream.av1; return streams[0].masterUrl; } return 'NO_VIDEO_FOUND'; })()"
+browser act "Click the X close button on the login popup"
 ```
 
-3. **下载**（CDN 完全公开，无需认证头）：
+3. **提取视频地址**（分步执行，避免 IIFE 语法问题）：
+```bash
+# 先获取 note ID
+browser console exec "Object.keys(window.__INITIAL_STATE__.note.noteDetailMap)[0]"
+# 假设返回 ID 为 xxx，检查是否为视频
+browser console exec "window.__INITIAL_STATE__.note.noteDetailMap['<NOTE_ID>'].note.type"
+# 如果 type 为 'video'，提取 masterUrl
+browser console exec "window.__INITIAL_STATE__.note.noteDetailMap['<NOTE_ID>'].note.video.media.stream.h264[0].masterUrl"
+```
+
+4. **下载**（CDN 完全公开，无需认证头）：
 ```bash
 curl -L -o /tmp/xhs_video.mp4 "<masterUrl>"
 ```
@@ -122,8 +128,9 @@ curl -L -o /tmp/xhs_video.mp4 "<masterUrl>"
 - 小红书 CDN 是完全公开的，curl 直接下载即可，**无需 Referer 或其他认证头**
 - 音视频是合一的 MP4，**不需要 ffmpeg 合并**
 - `__INITIAL_STATE__` 在 SSR 页面中始终存在
-- 如果是图文笔记（无视频），`video` 字段会为空，需提示用户
+- 如果是图文笔记（无视频），`note.type` 为 `normal` 而非 `video`，需提示用户
 - 短链接 `xhslink.com` 会自动重定向到完整 URL
+- **避免使用 IIFE `(() => {...})()` 语法**，browser console exec 对此处理不稳定，改用分步查询
 
 ---
 
@@ -136,14 +143,28 @@ curl -L -o /tmp/xhs_video.mp4 "<masterUrl>"
 browser navigate "https://www.douyin.com/video/xxxxxxxxxxxxxxxxx"
 ```
 
+> **注意**：抖音可能会将视频页重定向到首页推荐流。无论是否重定向，只要能获取到 cookie 即可继续。
+> 如果重定向了，视频 ID 可能在 URL 参数 `vid` 中：`?vid=xxx`
+
 2. **提取视频 ID**：
 ```bash
-browser console exec "window.location.pathname.match(/video\\/(\\d+)/)?.[1] || window.location.href.match(/(\\d{19})/)?.[1]"
+browser console exec "window.location.pathname.match(/video\\/(\\d+)/)?.[1] || new URLSearchParams(window.location.search).get('vid') || window.location.href.match(/(\\d{19})/)?.[1]"
 ```
 
-3. **调用抖音内部 API 获取视频信息**：
+3. **调用抖音内部 API 获取视频信息**（异步，分两步）：
+
+> **关键**：`browser console exec` 无法直接返回 Promise 结果。必须先将结果存到 `window` 变量，等待 3 秒后再读取。
+
+Step 3a - 发起请求并存储结果：
 ```bash
-browser console exec "fetch('/aweme/v1/web/aweme/detail/?aweme_id=<VIDEO_ID>&aid=6383&cookie_enabled=true&browser_language=zh-CN&browser_platform=MacIntel&browser_name=Chrome&browser_version=120', { headers: { 'Referer': 'https://www.douyin.com/' } }).then(r => r.json()).then(d => JSON.stringify(d.aweme_detail.video.play_addr.url_list))"
+browser console exec "fetch('/aweme/v1/web/aweme/detail/?aweme_id=<VIDEO_ID>&aid=6383&cookie_enabled=true', { headers: { 'Referer': 'https://www.douyin.com/' } }).then(r => r.text()).then(t => { window.__dy_result = t; console.log('DONE'); })"
+```
+
+Step 3b - 等待 3 秒后读取结果：
+```bash
+# 等待 3 秒
+sleep 3
+browser console exec "JSON.parse(window.__dy_result).aweme_detail.video.play_addr.url_list[0]"
 ```
 
 4. **下载**（需要 Referer）：
@@ -154,11 +175,13 @@ curl -L -o /tmp/douyin_video.mp4 \
   "<play_addr.url_list中的第一个URL>"
 ```
 
-### 备选方案
+### 备选方案：RENDER_DATA
 
-如果 API 调用失败，尝试从页面渲染数据提取：
+如果 API 调用失败，尝试从页面渲染数据提取（仅在视频详情页有效，推荐流首页不可用）：
 ```bash
-browser console exec "(() => { const scripts = document.querySelectorAll('script[id=RENDER_DATA]'); if (scripts.length) { const data = JSON.parse(decodeURIComponent(scripts[0].textContent)); const keys = Object.keys(data); for (const key of keys) { const item = data[key]; if (item && item.awemeDetail && item.awemeDetail.video) { return JSON.stringify(item.awemeDetail.video.playAddr || item.awemeDetail.video.play_addr); } } } return 'NOT_FOUND'; })()"
+browser console exec "document.querySelectorAll('script[id=RENDER_DATA]').length"
+# 如果为 1，继续：
+browser console exec "Object.keys(JSON.parse(decodeURIComponent(document.querySelector('script[id=RENDER_DATA]').textContent)).app).includes('videoDetail') ? 'has_detail' : 'no_detail'"
 ```
 
 ### 注意事项
@@ -167,6 +190,7 @@ browser console exec "(() => { const scripts = document.querySelectorAll('script
 - 抖音反爬较严格，如果 API 返回空或错误，可能需要等待页面完全加载
 - `play_addr.url_list` 通常有多个 CDN 地址，第一个就行
 - 视频 ID 通常是 19 位数字
+- **异步 fetch 必须分两步**：先存到 window 变量，sleep 后再读取
 
 ---
 

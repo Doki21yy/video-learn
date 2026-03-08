@@ -78,9 +78,9 @@ Step 2: 浏览器 fallback
   关键点：
   - B站第一次可能 412，等 5 秒重新 navigate
   - B站用 __playinfo__.data.dash，视频+音频分下载后 ffmpeg 合并
-  - YouTube 用 ytInitialPlayerResponse.streamingData
-  - 小红书用 __INITIAL_STATE__ 的 masterUrl
-  - 抖音用 /aweme/v1/web/aweme/detail/ API
+  - YouTube 浏览器方案不可用（signatureCipher 加密），必须用 yt-dlp
+  - 小红书用 __INITIAL_STATE__ 的 masterUrl（注意帖子页需要 xsec_token 参数）
+  - 抖音用 /aweme/v1/web/aweme/detail/ API（异步，需分两步：存到 window 变量 + sleep 后读取）
 
 Step 3: 本地文件继续（需注入 source_url）
   # 压缩
