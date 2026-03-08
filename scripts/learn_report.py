@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-learn_report.py - 深度学习指南 HTML 报告生成器
-生成文章式知识结构报告，类似高质量学习笔记/教程文档
+learn_report.py - Dark minimalist learning report HTML generator
+Generates premium dark-themed learning guide reports from video analysis data.
 """
 
 import argparse
@@ -20,14 +20,13 @@ def escape_html(text):
 
 
 def markdown_to_html(md_text):
-    """简单的 Markdown -> HTML 转换（支持常用语法）"""
+    """Simple Markdown -> HTML conversion."""
     if not md_text:
         return ""
     text = str(md_text)
 
-    # Code blocks ``` ... ```
+    # Code blocks
     def code_block_repl(m):
-        lang = m.group(1) or ""
         code = escape_html(m.group(2).strip())
         return f'<pre class="code-block"><code>{code}</code></pre>'
     text = re.sub(r'```(\w*)\n(.*?)```', code_block_repl, text, flags=re.DOTALL)
@@ -44,22 +43,18 @@ def markdown_to_html(md_text):
     # Links
     text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2" target="_blank" rel="noopener">\1</a>', text)
 
-    # Headers within section content (h4/h5 only since h2/h3 used for sections)
+    # Headers
     text = re.sub(r'^#### (.+)$', r'<h5 class="content-h5">\1</h5>', text, flags=re.MULTILINE)
     text = re.sub(r'^### (.+)$', r'<h4 class="content-h4">\1</h4>', text, flags=re.MULTILINE)
 
-    # Convert line groups to paragraphs and lists
     lines = text.split('\n')
     result = []
     in_list = False
-    list_type = None  # 'ul' or 'ol'
+    list_type = None
 
     for line in lines:
         stripped = line.strip()
-
-        # Numbered list
         ol_match = re.match(r'^(\d+)\.\s+(.+)$', stripped)
-        # Bullet list
         ul_match = re.match(r'^[-*]\s+(.+)$', stripped)
 
         if ol_match:
@@ -116,50 +111,277 @@ def time_to_seconds(time_str):
         return 0
 
 
-def difficulty_label(d):
+def detect_platform_from_url(url):
+    if not url:
+        return "unknown"
+    url = url.lower()
+    if "bilibili" in url:
+        return "bilibili"
+    if "youtube" in url or "youtu.be" in url:
+        return "youtube"
+    if "xiaohongshu" in url or "xhslink" in url:
+        return "xiaohongshu"
+    if "douyin" in url:
+        return "douyin"
+    return "unknown"
+
+
+PLATFORM_COLORS = {
+    "bilibili": "#00A1D6",
+    "youtube": "#FF0000",
+    "xiaohongshu": "#FE2C55",
+    "douyin": "#FFFFFF",
+    "unknown": "#6366F1",
+}
+
+PLATFORM_LABELS = {
+    "bilibili": "Bilibili",
+    "youtube": "YouTube",
+    "xiaohongshu": "XHS",
+    "douyin": "Douyin",
+    "unknown": "Video",
+}
+
+
+def build_video_embed(source_url):
+    """Build platform-specific video embed HTML."""
+    if not source_url:
+        return '<a href="#" class="video-link-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg><span>No video link available</span></a>'
+
+    url = source_url.strip()
+
+    # Bilibili
+    if "bilibili.com" in url:
+        bv_match = re.search(r'(BV[\w]+)', url)
+        if bv_match:
+            bvid = bv_match.group(1)
+            return f'<iframe src="//player.bilibili.com/player.html?bvid={bvid}&high_quality=1&danmaku=0" allowfullscreen="true" frameborder="0"></iframe>'
+
+    # YouTube
+    if "youtube.com" in url or "youtu.be" in url:
+        yt_match = re.search(r'(?:v=|youtu\.be/)([\w-]+)', url)
+        if yt_match:
+            vid = yt_match.group(1)
+            return f'<iframe src="https://www.youtube.com/embed/{vid}" allowfullscreen frameborder="0"></iframe>'
+
+    # Fallback: link button
+    return f'<a href="{escape_html(url)}" target="_blank" class="video-link-fallback"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="5 3 19 12 5 21 5 3"/></svg><span>Watch on original platform</span></a>'
+
+
+def build_platform_badge(source_url):
+    platform = detect_platform_from_url(source_url)
+    color = PLATFORM_COLORS.get(platform, PLATFORM_COLORS["unknown"])
+    label = PLATFORM_LABELS.get(platform, "Video")
+    return f'<span class="meta-badge platform"><span class="p-dot" style="background:{color}"></span>{label}</span>'
+
+
+def build_score_badge(score):
+    if not score:
+        return ""
+    return f'<span class="meta-badge score">{float(score):.1f}/10</span>'
+
+
+def build_duration_badge(duration_sec):
+    if not duration_sec:
+        return ""
+    return f'<span class="meta-badge duration">{seconds_to_display(duration_sec)}</span>'
+
+
+def build_date_badge(date_str):
+    if not date_str:
+        return ""
+    return f'<span class="meta-badge date">{escape_html(date_str)}</span>'
+
+
+def build_difficulty_tag(difficulty):
     labels = {
-        "beginner": ("初级", "pill-diff-b"),
-        "intermediate": ("中级", "pill-diff-i"),
-        "advanced": ("高级", "pill-diff-a"),
+        "beginner": ("Beginner", "difficulty-beginner"),
+        "intermediate": ("Intermediate", "difficulty-intermediate"),
+        "advanced": ("Advanced", "difficulty-advanced"),
     }
-    return labels.get(d, labels["intermediate"])
+    label, cls = labels.get(difficulty, labels["intermediate"])
+    return f'<span class="tag-pill {cls}">{label}</span>'
 
 
-def build_tags_html(analysis):
-    tags = analysis.get("tags", [])
-    return "".join(f'<span class="tag">{escape_html(t)}</span>' for t in tags[:6])
+def build_category_tag(category):
+    if not category:
+        return ""
+    return f'<span class="tag-pill">{escape_html(category)}</span>'
 
 
-def build_resources_html(resources):
+def build_speaker_tag(speaker):
+    if not speaker:
+        return ""
+    return f'<span class="tag-pill">{escape_html(speaker)}</span>'
+
+
+def build_knowledge_items(sections):
+    """Build knowledge points from analysis sections."""
+    if not sections:
+        return '<li class="knowledge-item"><div class="knowledge-explain">No knowledge points extracted.</div></li>'
+    items = []
+    for sec in sections:
+        title = escape_html(sec.get("title", ""))
+        # Use first paragraph of content as explanation
+        content = sec.get("content", "")
+        # Extract first meaningful line
+        explain = ""
+        for line in str(content).split("\n"):
+            line = line.strip()
+            if line and not line.startswith("#") and not line.startswith("```"):
+                explain = line[:300]
+                break
+        if not explain:
+            explain = content[:300] if content else ""
+
+        items.append(f'''<li class="knowledge-item">
+            <div class="knowledge-concept">{title}</div>
+            <div class="knowledge-explain">{escape_html(explain)}</div>
+        </li>''')
+    return "\n".join(items)
+
+
+def build_chapter_items(scene_breakdown):
+    """Build chapter accordion from scene breakdown data."""
+    chapters = []
+    if isinstance(scene_breakdown, dict):
+        chapters = scene_breakdown.get("chapters", [])
+
+    if not chapters:
+        return '<div class="chapter-item"><div class="chapter-header"><div class="chapter-header-left"><span class="chapter-time">--</span><span class="chapter-title">No chapter data available</span></div></div></div>'
+
+    items = []
+    for ch in chapters:
+        ch_title = escape_html(ch.get("chapter", ch.get("title", "Chapter")))
+        ch_start = escape_html(str(ch.get("start", "")))
+        ch_end = escape_html(str(ch.get("end", "")))
+        time_range = f"{ch_start}" if ch_start else ""
+
+        scenes = ch.get("scenes", [])
+        summary_parts = []
+        key_points = []
+        for s in scenes:
+            narr = s.get("narration", s.get("visual", ""))
+            if narr:
+                summary_parts.append(str(narr))
+            concept = s.get("core_concept", "")
+            if concept:
+                key_points.append(escape_html(str(concept)))
+
+        summary = escape_html(". ".join(summary_parts)[:300]) if summary_parts else ""
+        points_html = "".join(f"<li>{p}</li>" for p in key_points[:5])
+
+        arrow_svg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>'
+
+        items.append(f'''<div class="chapter-item">
+            <div class="chapter-header">
+                <div class="chapter-header-left">
+                    <span class="chapter-time">{time_range}</span>
+                    <span class="chapter-title">{ch_title}</span>
+                </div>
+                <span class="chapter-arrow">{arrow_svg}</span>
+            </div>
+            <div class="chapter-content">
+                <div class="chapter-inner">
+                    {f'<div class="chapter-summary">{summary}</div>' if summary else ''}
+                    {f'<ul class="chapter-points">{points_html}</ul>' if points_html else ''}
+                </div>
+            </div>
+        </div>''')
+
+    return "\n".join(items)
+
+
+def build_quote_items(analysis):
+    """Build quote cards. Try quotes from scene breakdown or key insights."""
+    quotes = []
+
+    # Try to extract notable quotes from scene breakdown
+    scene_breakdown = analysis.get("scene_breakdown", {})
+    if isinstance(scene_breakdown, dict):
+        for ch in scene_breakdown.get("chapters", []):
+            for s in ch.get("scenes", []):
+                note = s.get("note", "")
+                if note and len(str(note)) > 20:
+                    time_str = s.get("start", "")
+                    quotes.append({"text": str(note), "time": str(time_str)})
+
+    # Also extract from key_tips as notable insights
+    for tip in analysis.get("key_tips", []):
+        if tip and len(str(tip)) > 20:
+            quotes.append({"text": str(tip), "time": ""})
+
+    if not quotes:
+        return '<div class="quote-card"><div class="quote-text">No notable quotes extracted from this video.</div></div>'
+
+    # Limit to 5 quotes
+    items = []
+    for q in quotes[:5]:
+        text = escape_html(q["text"])
+        time_html = f'<div class="quote-time">{escape_html(q["time"])}</div>' if q["time"] else ""
+        items.append(f'''<div class="quote-card">
+            <div class="quote-text">{text}</div>
+            {time_html}
+        </div>''')
+
+    return "\n".join(items)
+
+
+def build_takeaway_items(analysis):
+    """Build takeaway checklist from key_tips and summary."""
+    takeaways = []
+
+    for tip in analysis.get("key_tips", []):
+        if tip:
+            takeaways.append(str(tip))
+
+    # Add FAQ answers as additional takeaways
+    for faq in analysis.get("faq", []):
+        q = faq.get("question", "")
+        if q:
+            takeaways.append(str(q))
+
+    if not takeaways:
+        return '<li class="takeaway-item"><span class="takeaway-check"></span>No takeaways extracted.</li>'
+
+    check_svg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>'
+    items = []
+    for t in takeaways[:8]:
+        items.append(f'''<li class="takeaway-item">
+            <span class="takeaway-check">{check_svg}</span>
+            {escape_html(t)}
+        </li>''')
+
+    return "\n".join(items)
+
+
+def build_resource_rows(resources):
+    """Build resource table rows."""
     if not resources:
-        return '<p class="empty-hint">视频中未提及具体工具或资源链接。</p>'
+        return '<tr><td colspan="3" style="color:var(--text-muted);font-style:italic">No tools or resources mentioned.</td></tr>'
+
     rows = []
     for r in resources:
         name = escape_html(r.get("name", ""))
-        url = r.get("url", "")
         desc = escape_html(r.get("description", ""))
-        rtype = escape_html(r.get("type", ""))
-        type_badge = f'<span class="res-type">{rtype}</span>' if rtype else ""
+        url = r.get("url", "")
         if url and url.startswith("http"):
-            name_html = f'<a href="{escape_html(url)}" target="_blank" rel="noopener">{name}</a>'
+            link_html = f'<a href="{escape_html(url)}" target="_blank" rel="noopener">Link</a>'
         else:
-            name_html = name
-        rows.append(f'''<tr>
-            <td class="res-name">{name_html} {type_badge}</td>
-            <td class="res-desc">{desc}</td>
-        </tr>''')
-    return f'''<table class="res-table">
-        <thead><tr><th>名称</th><th>说明</th></tr></thead>
-        <tbody>{"".join(rows)}</tbody>
-    </table>'''
+            link_html = '<span style="color:var(--text-muted)">--</span>'
+        rows.append(f'<tr><td>{name}</td><td>{desc}</td><td>{link_html}</td></tr>')
+
+    return "\n".join(rows)
 
 
 def build_sections_html(sections):
+    """Build detailed content sections (the main learning content)."""
     if not sections:
         return ""
+
     parts = []
     for i, sec in enumerate(sections):
-        title = escape_html(sec.get("title", f"第{i+1}节"))
+        title = escape_html(sec.get("title", f"Section {i+1}"))
         content = markdown_to_html(sec.get("content", ""))
         subs = sec.get("subsections", [])
         subs_html = ""
@@ -181,390 +403,539 @@ def build_sections_html(sections):
     return "".join(parts)
 
 
-def build_tips_html(tips):
-    if not tips:
-        return ""
-    items = "".join(f'<li>{escape_html(t)}</li>' for t in tips)
-    return f'<ul class="tips-list">{items}</ul>'
-
-
-def build_faq_html(faq):
-    if not faq:
-        return ""
-    parts = []
-    for f in faq:
-        q = escape_html(f.get("question", ""))
-        a = markdown_to_html(f.get("answer", ""))
-        parts.append(f'''<div class="faq-item">
-            <div class="faq-q">Q: {q}</div>
-            <div class="faq-a">{a}</div>
-        </div>''')
-    return "".join(parts)
-
-
-def build_audience_html(audience):
-    if not audience:
-        return ""
-    items = "".join(f'<li>{escape_html(a)}</li>' for a in audience)
-    return f'<ol class="audience-list">{items}</ol>'
-
-
-def build_links_html(links):
-    if not links:
-        return ""
-    items = []
-    for lnk in links:
-        label = escape_html(lnk.get("label", ""))
-        url = lnk.get("url", "")
-        if url and url.startswith("http"):
-            items.append(f'<li><a href="{escape_html(url)}" target="_blank" rel="noopener">{label}</a></li>')
-        else:
-            items.append(f'<li>{label}: {escape_html(url)}</li>')
-    return f'<ul class="links-list">{"".join(items)}</ul>'
-
-
-def build_video_embed(source_url):
-    """Build platform-specific video embed (iframe or link)."""
-    if not source_url:
-        return ""
-
-    url = source_url.strip()
-
-    # Bilibili
-    if "bilibili.com" in url:
-        import re
-        bv_match = re.search(r'(BV[\w]+)', url)
-        if bv_match:
-            bvid = bv_match.group(1)
-            return f'''<div class="embed-wrap">
-  <iframe src="//player.bilibili.com/player.html?bvid={bvid}&high_quality=1&danmaku=0"
-    allowfullscreen="true" frameborder="0"
-    style="width:100%;aspect-ratio:16/9;border-radius:var(--r)"></iframe>
-</div>
-<a href="{escape_html(url)}" target="_blank" class="yt-btn" style="display:inline-block;margin-top:10px">在 B 站观看</a>'''
-
-    # YouTube
-    if "youtube.com" in url or "youtu.be" in url:
-        import re
-        yt_match = re.search(r'(?:v=|youtu\.be/)([\w-]+)', url)
-        if yt_match:
-            vid = yt_match.group(1)
-            return f'''<div class="embed-wrap">
-  <iframe src="https://www.youtube.com/embed/{vid}"
-    allowfullscreen frameborder="0"
-    style="width:100%;aspect-ratio:16/9;border-radius:var(--r)"></iframe>
-</div>
-<a href="{escape_html(url)}" target="_blank" class="yt-btn" style="display:inline-block;margin-top:10px">在 YouTube 观看</a>'''
-
-    # Other platforms: just a link button
-    return f'<a href="{escape_html(url)}" target="_blank" class="yt-btn" style="display:inline-block;margin-top:10px;font-size:1rem">在原平台观看视频</a>'
-
-
-def build_scene_cards(scene_breakdown):
-    """Build scene cards for video player sync panel."""
-    chapters = []
-    if isinstance(scene_breakdown, dict):
-        chapters = scene_breakdown.get("chapters", [])
-    cards = []
-    for ch in chapters:
-        for s in ch.get("scenes", []):
-            sid = escape_html(s.get("scene_id", ""))
-            start_s = time_to_seconds(s.get("start", "0:00"))
-            end_s = time_to_seconds(s.get("end", "0:30"))
-            concept = escape_html(s.get("core_concept", ""))
-            narr = escape_html(s.get("narration", s.get("visual", "")))
-            method = escape_html(s.get("teaching_method", ""))
-            clarity = s.get("clarity", "medium")
-            start_d = escape_html(s.get("start", "0:00"))
-            end_d = escape_html(s.get("end", ""))
-            cards.append(f'''<div class="sc" data-start="{start_s}" data-end="{end_s}" onclick="seekTo({start_s})">
-                <div class="sc-head">
-                    <span class="sc-id">{sid}</span>
-                    <span class="sc-time">{start_d} - {end_d}</span>
-                </div>
-                <div class="sc-concept">{concept}</div>
-                <div class="sc-narr">{narr}</div>
-                <div class="sc-tags">
-                    <span class="sc-tag method">{method}</span>
-                    <span class="clarity-dot clarity-{clarity}"></span>
-                </div>
-            </div>''')
-    return "".join(cards)
-
-
 def generate_html(analysis, title, video_base64=None, video_path=None):
-    """Generate the full learning guide HTML report."""
+    """Generate the full dark-themed learning report HTML."""
     a = analysis
 
     # Metadata
     title_cn = a.get("title_cn", title)
-    topic = a.get("topic", title)
     category = a.get("category", "")
     diff_str = a.get("difficulty", "intermediate")
-    diff_label, diff_class = difficulty_label(diff_str)
     rating = a.get("learning_rating", 0)
     speaker = a.get("speaker", "")
-    language = a.get("language", "")
     overview = a.get("overview", a.get("summary", ""))
-    summary = a.get("summary", "")
-    hw_req = a.get("hardware_requirements", "")
+    summary_text = a.get("summary", "")
 
-    # Duration
+    # Duration and source
     meta = a.get("_meta", {})
     duration_sec = meta.get("video_duration", 0)
-    duration_str = seconds_to_display(duration_sec) if duration_sec else ""
     source_url = meta.get("source_url", "")
     date_str = datetime.now().strftime("%Y-%m-%d")
 
-    # Video embed (platform iframe or fallback link)
-    video_embed_html = build_video_embed(source_url)
+    # Build components
+    video_embed = build_video_embed(source_url)
+    platform_badge = build_platform_badge(source_url)
+    score_badge = build_score_badge(rating)
+    duration_badge = build_duration_badge(duration_sec)
+    date_badge = build_date_badge(date_str)
+    difficulty_tag = build_difficulty_tag(diff_str)
+    category_tag = build_category_tag(category)
+    speaker_tag = build_speaker_tag(speaker)
+    knowledge_items = build_knowledge_items(a.get("sections", []))
+    chapter_items = build_chapter_items(a.get("scene_breakdown", {}))
+    quote_items = build_quote_items(a)
+    takeaway_items = build_takeaway_items(a)
+    resource_rows = build_resource_rows(a.get("resources", []))
 
-    # Build content sections
+    # Build detailed content sections
     sections_html = build_sections_html(a.get("sections", []))
-    resources_html = build_resources_html(a.get("resources", []))
-    tips_html = build_tips_html(a.get("key_tips", []))
-    faq_html = build_faq_html(a.get("faq", []))
-    audience_html = build_audience_html(a.get("target_audience", []))
-    links_html = build_links_html(a.get("related_links", []))
-    tags_html = build_tags_html(a)
-    scene_cards = build_scene_cards(a.get("scene_breakdown", {}))
-    scene_count = sum(len(ch.get("scenes", [])) for ch in a.get("scene_breakdown", {}).get("chapters", []))
 
-    # Video info
-    vi = a.get("video_info", {})
-    pub_date = vi.get("publish_date", "")
-    views = vi.get("views_estimate", "")
+    # FAQ section
+    faq_html = ""
+    faq_list = a.get("faq", [])
+    if faq_list:
+        faq_items = []
+        for f in faq_list:
+            q = escape_html(f.get("question", ""))
+            ans = markdown_to_html(f.get("answer", ""))
+            faq_items.append(f'''<div class="faq-item">
+                <div class="faq-q">Q: {q}</div>
+                <div class="faq-a">{ans}</div>
+            </div>''')
+        faq_html = f'''<div class="section-card">
+            <div class="section-label">FAQ</div>
+            {"".join(faq_items)}
+        </div>'''
 
-    # YouTube link button
-    yt_btn = ""
-    if source_url:
-        yt_btn = f'<a href="{escape_html(source_url)}" target="_blank" class="yt-btn">在原平台观看</a>'
+    # Summary section
+    summary_html = ""
+    if summary_text:
+        summary_html = f'''<div class="section-card">
+            <div class="section-label">Summary</div>
+            <div class="summary-box"><p>{escape_html(summary_text)}</p></div>
+        </div>'''
 
     html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{escape_html(title_cn)} - 视频学习笔记</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<title>{escape_html(title_cn)} - Learning Archive</title>
 <style>
-*{{margin:0;padding:0;box-sizing:border-box}}
-:root{{
-  --bg:#F6F5F0;--card:#FFFFFF;--border:#E2E0D8;--border-light:#EDEBE4;
-  --text:#1A1816;--text-2:#4A4640;--text-3:#8A857D;--text-4:#B5B0A6;
-  --ink:#6C63FF;--ink-light:#EEEDFF;--ink-mid:#C5C1FF;--ink-deep:#4F46E5;
-  --green:#16A34A;--green-bg:#F0FDF4;--amber:#D97706;--amber-bg:#FFFBEB;
-  --rose:#E11D48;--rose-bg:#FFF1F2;--teal:#0D9488;--teal-bg:#F0FDFA;
-  --serif:'Noto Serif SC',Georgia,serif;
-  --sans:'DM Sans',-apple-system,'Noto Sans SC',sans-serif;
-  --mono:'JetBrains Mono',monospace;
-  --r:14px;--r-sm:8px;
-  --sh:0 1px 2px rgba(26,24,22,.04),0 2px 8px rgba(26,24,22,.04);
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+*, *::before, *::after {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
+:root {{
+  --bg-deep: #06060B;
+  --bg-surface: #0D0D14;
+  --bg-card: #12121C;
+  --bg-card-hover: #181826;
+  --border-subtle: rgba(99, 102, 241, 0.08);
+  --border-hover: rgba(99, 102, 241, 0.2);
+  --text-primary: #E8E8ED;
+  --text-secondary: #7A7A8E;
+  --text-muted: #4A4A5E;
+  --accent: #6366F1;
+  --accent-glow: rgba(99, 102, 241, 0.15);
+  --accent-soft: #818CF8;
+  --radius: 12px;
+  --font-heading: 'DM Sans', -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
 }}
-html{{scroll-behavior:smooth}}
-body{{font-family:var(--sans);background:var(--bg);color:var(--text);line-height:1.8;-webkit-font-smoothing:antialiased;font-size:15px}}
-.page{{max-width:860px;margin:0 auto;padding:32px 24px 80px}}
-a{{color:var(--ink)}}
 
-/* Header */
-.badge-line{{font-family:var(--mono);font-size:.72rem;color:var(--ink);letter-spacing:.06em;margin-bottom:12px}}
-h1{{font-family:var(--serif);font-size:clamp(1.4rem,3vw,2rem);font-weight:700;line-height:1.35;letter-spacing:-.01em;margin-bottom:16px}}
-.meta-row{{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-bottom:20px}}
-.pill{{display:inline-flex;align-items:center;padding:3px 12px;border-radius:14px;font-size:.78rem;font-weight:500;border:1px solid var(--border)}}
-.pill-diff-b{{background:var(--green-bg);color:var(--green);border-color:#BBF7D0}}
-.pill-diff-i{{background:var(--amber-bg);color:var(--amber);border-color:#FDE68A}}
-.pill-diff-a{{background:var(--rose-bg);color:var(--rose);border-color:#FECACA}}
-.pill-cat{{background:var(--ink-light);color:var(--ink-deep);border-color:var(--ink-mid)}}
-.pill-mono{{font-family:var(--mono);font-size:.72rem;color:var(--text-3)}}
-.tag{{display:inline-flex;padding:2px 10px;border-radius:10px;font-size:.72rem;background:var(--card);border:1px solid var(--border);color:var(--text-3);margin:2px}}
-.yt-btn{{display:inline-flex;align-items:center;gap:6px;padding:6px 14px;border-radius:8px;background:var(--ink);color:#fff;text-decoration:none;font-size:.82rem;font-weight:500;transition:all .2s}}
-.yt-btn:hover{{background:var(--ink-deep)}}
+html {{ scroll-behavior: smooth; }}
 
-/* Overview */
-.overview{{font-size:1rem;color:var(--text-2);line-height:1.9;margin-bottom:32px;padding:24px 28px;background:var(--card);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh)}}
+body {{
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  font-family: var(--font-heading);
+  font-weight: 400;
+  line-height: 1.7;
+  min-height: 100vh;
+}}
 
-/* Module divider */
-.module{{margin-bottom:40px}}
-.module-title{{font-family:var(--serif);font-size:1.2rem;font-weight:600;margin-bottom:16px;padding-bottom:10px;border-bottom:2px solid var(--ink-mid);color:var(--text);display:flex;align-items:center;gap:8px}}
-.module-icon{{font-size:1rem}}
+body::before {{
+  content: '';
+  position: fixed;
+  top: -200px; left: 50%;
+  transform: translateX(-50%);
+  width: 800px; height: 600px;
+  background: radial-gradient(ellipse, rgba(99, 102, 241, 0.05) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}}
 
-/* Sections (main content) */
-.section-block{{margin-bottom:32px;background:var(--card);border:1px solid var(--border);border-radius:var(--r);padding:28px 32px;box-shadow:var(--sh)}}
-.sec-title{{font-family:var(--serif);font-size:1.1rem;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:10px}}
-.sec-num{{font-family:var(--mono);font-size:.72rem;color:#fff;background:var(--ink);width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}}
-.sec-body{{color:var(--text-2);line-height:1.9}}
-.sec-body p{{margin-bottom:12px}}
-.sec-body strong{{color:var(--text);font-weight:600}}
-.subsection{{margin-top:20px;padding-top:16px;border-top:1px solid var(--border-light)}}
-.subsec-title{{font-size:.95rem;font-weight:600;margin-bottom:10px;color:var(--text)}}
-.subsec-body{{color:var(--text-2)}}
-.subsec-body p{{margin-bottom:10px}}
+.container {{
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 0 24px;
+  position: relative;
+  z-index: 1;
+}}
 
-/* Content elements */
-.content-list{{margin:12px 0;padding-left:24px}}
-.content-list li{{margin-bottom:6px;line-height:1.7}}
-.content-h4{{font-size:1rem;font-weight:600;margin:16px 0 8px;color:var(--text)}}
-.content-h5{{font-size:.92rem;font-weight:600;margin:12px 0 6px;color:var(--text-2)}}
-.code-block{{background:#1E1E2E;color:#CDD6F4;padding:16px 20px;border-radius:var(--r-sm);overflow-x:auto;font-family:var(--mono);font-size:.82rem;line-height:1.6;margin:12px 0}}
-.inline-code{{background:var(--ink-light);color:var(--ink-deep);padding:1px 6px;border-radius:4px;font-family:var(--mono);font-size:.85em}}
+a {{ color: var(--accent-soft); text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
 
-/* Resources table */
-.res-table{{width:100%;border-collapse:collapse;margin:8px 0;font-size:.88rem}}
-.res-table th{{text-align:left;padding:10px 12px;border-bottom:2px solid var(--border);color:var(--text-3);font-weight:500;font-size:.78rem}}
-.res-table td{{padding:10px 12px;border-bottom:1px solid var(--border-light)}}
-.res-name{{font-weight:500;white-space:nowrap}}
-.res-name a{{text-decoration:none}}
-.res-name a:hover{{text-decoration:underline}}
-.res-type{{font-size:.65rem;padding:2px 6px;border-radius:6px;background:var(--ink-light);color:var(--ink);margin-left:6px;font-weight:500}}
-.res-desc{{color:var(--text-3)}}
+/* Back Nav */
+.back-nav {{ padding: 24px 0; }}
+.back-link {{
+  display: inline-flex; align-items: center; gap: 6px;
+  color: var(--text-muted); text-decoration: none;
+  font-family: var(--font-mono); font-size: 0.78rem;
+  transition: color 0.2s;
+}}
+.back-link:hover {{ color: var(--accent-soft); text-decoration: none; }}
+.back-link svg {{ width: 16px; height: 16px; }}
 
-/* Tips */
-.tips-list{{list-style:none;padding:0}}
-.tips-list li{{padding:10px 16px 10px 40px;position:relative;border-bottom:1px solid var(--border-light);font-size:.92rem}}
-.tips-list li::before{{content:'\\2713';position:absolute;left:12px;top:10px;color:var(--green);font-weight:700}}
+/* Hero */
+.hero {{ padding-bottom: 40px; }}
+
+.video-embed {{
+  width: 100%; aspect-ratio: 16/9;
+  border-radius: var(--radius); overflow: hidden;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  margin-bottom: 28px;
+}}
+.video-embed iframe {{ width: 100%; height: 100%; border: none; }}
+.video-embed .video-link-fallback {{
+  width: 100%; height: 100%;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; gap: 12px;
+  color: var(--text-secondary); text-decoration: none;
+}}
+.video-embed .video-link-fallback:hover {{ color: var(--accent-soft); }}
+.video-embed .video-link-fallback svg {{ width: 48px; height: 48px; opacity: 0.5; }}
+
+.hero-title {{
+  font-family: var(--font-heading);
+  font-weight: 900;
+  font-size: clamp(1.6rem, 4vw, 2.4rem);
+  letter-spacing: -0.02em; line-height: 1.25;
+  color: var(--text-primary);
+  margin-bottom: 16px;
+}}
+
+.hero-meta {{
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+}}
+
+.meta-badge {{
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 12px; border-radius: 6px;
+  font-family: var(--font-mono); font-size: 0.72rem;
+  font-weight: 500; letter-spacing: 0.03em;
+}}
+.meta-badge.platform {{
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+}}
+.meta-badge.platform .p-dot {{
+  width: 6px; height: 6px; border-radius: 50%;
+}}
+.meta-badge.score {{
+  background: var(--accent-glow);
+  border: 1px solid rgba(99, 102, 241, 0.15);
+  color: var(--accent-soft);
+}}
+.meta-badge.duration, .meta-badge.date {{
+  color: var(--text-muted);
+  font-family: var(--font-mono); font-size: 0.72rem;
+}}
+
+/* Section Cards */
+.section-card {{
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 28px 32px;
+  margin-bottom: 16px;
+}}
+.section-label {{
+  font-family: var(--font-mono);
+  font-size: 0.68rem; font-weight: 500;
+  color: var(--accent-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 16px;
+}}
+.section-heading {{
+  font-family: var(--font-heading);
+  font-weight: 700; font-size: 1.15rem;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}}
+.section-text {{
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  line-height: 1.75;
+}}
+
+/* Tags */
+.tag-row {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }}
+.tag-pill {{
+  padding: 3px 10px; border-radius: 4px;
+  font-family: var(--font-mono); font-size: 0.7rem; font-weight: 500;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}}
+.tag-pill.difficulty-beginner {{ border-color: rgba(34, 197, 94, 0.2); color: #4ADE80; }}
+.tag-pill.difficulty-intermediate {{ border-color: rgba(250, 204, 21, 0.2); color: #FACC15; }}
+.tag-pill.difficulty-advanced {{ border-color: rgba(239, 68, 68, 0.2); color: #F87171; }}
+
+/* Knowledge Points */
+.knowledge-list {{ list-style: none; }}
+.knowledge-item {{ padding: 14px 0; border-bottom: 1px solid var(--border-subtle); }}
+.knowledge-item:last-child {{ border-bottom: none; }}
+.knowledge-concept {{
+  font-family: var(--font-heading); font-weight: 700;
+  font-size: 0.9rem; color: var(--text-primary);
+  margin-bottom: 4px;
+}}
+.knowledge-explain {{
+  font-size: 0.84rem; color: var(--text-secondary); line-height: 1.65;
+}}
+
+/* Chapters Accordion */
+.chapter-item {{ border-bottom: 1px solid var(--border-subtle); }}
+.chapter-item:last-child {{ border-bottom: none; }}
+.chapter-header {{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 0; cursor: pointer; user-select: none;
+  transition: color 0.2s;
+}}
+.chapter-header:hover {{ color: var(--accent-soft); }}
+.chapter-header-left {{
+  display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0;
+}}
+.chapter-time {{
+  font-family: var(--font-mono); font-size: 0.72rem;
+  color: var(--accent-soft); white-space: nowrap; flex-shrink: 0;
+}}
+.chapter-title {{
+  font-family: var(--font-heading); font-weight: 600;
+  font-size: 0.9rem; color: var(--text-primary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}}
+.chapter-arrow {{
+  color: var(--text-muted);
+  transition: transform 0.3s ease; flex-shrink: 0;
+}}
+.chapter-item.open .chapter-arrow {{ transform: rotate(180deg); }}
+.chapter-content {{ max-height: 0; overflow: hidden; transition: max-height 0.35s ease; }}
+.chapter-item.open .chapter-content {{ max-height: 500px; }}
+.chapter-inner {{ padding: 0 0 20px 0; }}
+.chapter-summary {{
+  font-size: 0.85rem; color: var(--text-secondary);
+  margin-bottom: 12px; line-height: 1.7;
+}}
+.chapter-points {{ list-style: none; padding: 0; }}
+.chapter-points li {{
+  position: relative; padding-left: 16px;
+  margin-bottom: 6px; font-size: 0.82rem; color: var(--text-secondary);
+}}
+.chapter-points li::before {{
+  content: ''; position: absolute; left: 0; top: 9px;
+  width: 4px; height: 4px; border-radius: 50%; background: var(--accent);
+}}
+
+/* Quotes */
+.quote-card {{
+  position: relative; padding: 20px 24px;
+  margin-bottom: 12px;
+  border-left: 2px solid var(--accent);
+  background: rgba(99, 102, 241, 0.03);
+  border-radius: 0 8px 8px 0;
+}}
+.quote-card:last-child {{ margin-bottom: 0; }}
+.quote-text {{
+  font-size: 0.9rem; color: var(--text-primary);
+  font-style: italic; line-height: 1.65; margin-bottom: 8px;
+}}
+.quote-time {{
+  font-family: var(--font-mono); font-size: 0.7rem; color: var(--accent-soft);
+}}
+
+/* Takeaways */
+.takeaway-list {{ list-style: none; }}
+.takeaway-item {{
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 8px 0; font-size: 0.88rem; color: var(--text-secondary);
+}}
+.takeaway-check {{
+  width: 18px; height: 18px;
+  border: 1.5px solid var(--border-hover);
+  border-radius: 4px; flex-shrink: 0; margin-top: 2px;
+  display: flex; align-items: center; justify-content: center;
+}}
+.takeaway-check svg {{
+  width: 12px; height: 12px; color: var(--accent-soft);
+}}
+
+/* Resources Table */
+.resource-table {{ width: 100%; border-collapse: collapse; }}
+.resource-table th {{
+  text-align: left; font-family: var(--font-mono);
+  font-size: 0.7rem; font-weight: 500; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  padding: 10px 0; border-bottom: 1px solid var(--border-subtle);
+}}
+.resource-table td {{
+  padding: 10px 0; font-size: 0.84rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-subtle);
+}}
+.resource-table tr:last-child td {{ border-bottom: none; }}
+.resource-table a {{ color: var(--accent-soft); text-decoration: none; }}
+.resource-table a:hover {{ text-decoration: underline; }}
+
+/* Detailed Content Sections */
+.section-block {{
+  margin-bottom: 20px;
+  background: rgba(99, 102, 241, 0.02);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 24px 28px;
+}}
+.sec-title {{
+  font-family: var(--font-heading);
+  font-size: 1rem; font-weight: 700;
+  margin-bottom: 14px; display: flex; align-items: center; gap: 10px;
+  color: var(--text-primary);
+}}
+.sec-num {{
+  font-family: var(--font-mono); font-size: 0.68rem;
+  color: #fff; background: var(--accent);
+  width: 24px; height: 24px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}}
+.sec-body {{ color: var(--text-secondary); line-height: 1.8; font-size: 0.88rem; }}
+.sec-body p {{ margin-bottom: 10px; }}
+.sec-body strong {{ color: var(--text-primary); font-weight: 600; }}
+.subsection {{ margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border-subtle); }}
+.subsec-title {{ font-size: 0.92rem; font-weight: 600; margin-bottom: 8px; color: var(--text-primary); }}
+.subsec-body {{ color: var(--text-secondary); font-size: 0.86rem; }}
+.subsec-body p {{ margin-bottom: 8px; }}
+.content-list {{ margin: 10px 0; padding-left: 22px; }}
+.content-list li {{ margin-bottom: 5px; line-height: 1.65; }}
+.content-h4 {{ font-size: 0.95rem; font-weight: 600; margin: 14px 0 8px; color: var(--text-primary); }}
+.content-h5 {{ font-size: 0.88rem; font-weight: 600; margin: 10px 0 6px; color: var(--text-secondary); }}
+.code-block {{
+  background: #0D0D14; color: #CDD6F4;
+  padding: 14px 18px; border-radius: 8px;
+  overflow-x: auto; font-family: var(--font-mono);
+  font-size: 0.8rem; line-height: 1.6; margin: 10px 0;
+  border: 1px solid var(--border-subtle);
+}}
+.inline-code {{
+  background: var(--accent-glow); color: var(--accent-soft);
+  padding: 1px 6px; border-radius: 4px;
+  font-family: var(--font-mono); font-size: 0.85em;
+}}
 
 /* FAQ */
-.faq-item{{margin-bottom:16px;padding:16px 20px;background:var(--card);border:1px solid var(--border);border-radius:var(--r-sm)}}
-.faq-q{{font-weight:600;color:var(--ink-deep);margin-bottom:8px}}
-.faq-a{{color:var(--text-2);font-size:.92rem}}
-.faq-a p{{margin-bottom:6px}}
+.faq-item {{
+  margin-bottom: 14px; padding: 16px 20px;
+  background: rgba(99, 102, 241, 0.02);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}}
+.faq-q {{ font-weight: 600; color: var(--accent-soft); margin-bottom: 8px; font-size: 0.9rem; }}
+.faq-a {{ color: var(--text-secondary); font-size: 0.86rem; }}
+.faq-a p {{ margin-bottom: 6px; }}
 
-/* Audience */
-.audience-list{{padding-left:24px}}
-.audience-list li{{margin-bottom:6px;font-size:.92rem}}
-
-/* Links */
-.links-list{{list-style:none;padding:0}}
-.links-list li{{padding:6px 0;border-bottom:1px solid var(--border-light);font-size:.88rem}}
-
-/* Summary box */
-.summary-box{{background:linear-gradient(135deg,var(--ink-light) 0%,#F5F3FF 100%);border:1px solid var(--ink-mid);border-radius:var(--r);padding:28px 32px;margin-top:16px}}
-.summary-box p{{color:var(--text);line-height:1.9;font-size:.95rem}}
-
-/* HW requirements */
-.hw-box{{background:var(--teal-bg);border:1px solid #99F6E4;border-radius:var(--r-sm);padding:16px 20px;font-size:.88rem;color:#0F766E}}
-
-/* Video player */
-.player-grid{{display:grid;grid-template-columns:1fr 340px;gap:16px;align-items:start;margin-bottom:8px}}
-.player-grid video,.player-grid .embed-wrap{{width:100%;border-radius:var(--r);background:#0a0a0f;aspect-ratio:16/9}}
-.scene-scroll{{max-height:400px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:4px}}
-.scene-scroll::-webkit-scrollbar{{width:3px}}
-.scene-scroll::-webkit-scrollbar-thumb{{background:var(--border);border-radius:2px}}
-.scene-label{{font-size:.78rem;color:var(--text-3);margin-bottom:6px}}
-.sc{{background:var(--card);border:1px solid var(--border);border-left:3px solid transparent;border-radius:8px;padding:10px 12px;cursor:pointer;transition:all .2s;font-size:.82rem}}
-.sc:hover{{border-left-color:var(--ink-mid);background:#FEFDFB}}
-.sc.active{{border-left-color:var(--ink);background:var(--ink-light)}}
-.sc-head{{display:flex;justify-content:space-between;align-items:center;margin-bottom:3px}}
-.sc-id{{font-weight:600;font-size:.72rem;color:var(--ink)}}
-.sc-time{{font-size:.68rem;color:var(--text-4)}}
-.sc-concept{{font-weight:600;font-size:.82rem;margin-bottom:2px}}
-.sc-narr{{font-size:.75rem;color:var(--text-3);line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}}
-.sc-tags{{display:flex;gap:4px;margin-top:4px}}
-.sc-tag{{font-size:.65rem;padding:1px 6px;border-radius:8px;background:#F5F5F4;color:var(--text-4)}}
-.sc-tag.method{{background:var(--ink-light);color:var(--ink)}}
-.clarity-dot{{width:6px;height:6px;border-radius:50%;display:inline-block;margin-left:2px}}
-.clarity-high{{background:var(--green)}}.clarity-medium{{background:var(--amber)}}.clarity-low{{background:var(--rose)}}
-
-.empty-hint{{color:var(--text-4);font-size:.88rem;font-style:italic}}
+/* Summary Box */
+.summary-box {{
+  background: rgba(99, 102, 241, 0.04);
+  border: 1px solid rgba(99, 102, 241, 0.1);
+  border-radius: var(--radius);
+  padding: 24px 28px;
+}}
+.summary-box p {{ color: var(--text-secondary); line-height: 1.85; font-size: 0.92rem; }}
 
 /* Footer */
-.foot{{text-align:center;padding:24px 0;color:var(--text-4);font-size:.78rem;border-top:1px solid var(--border-light);margin-top:40px}}
-.foot a{{color:var(--ink);text-decoration:none}}
+.report-footer {{
+  padding: 48px 0 32px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}}
 
-@media(max-width:768px){{
-  .page{{padding:20px 16px 60px}}
-  .player-grid{{grid-template-columns:1fr}}
-  .scene-scroll{{max-height:260px}}
-  .section-block{{padding:20px}}
+/* Animations */
+@keyframes fadeInUp {{
+  from {{ opacity: 0; transform: translateY(16px); }}
+  to {{ opacity: 1; transform: translateY(0); }}
+}}
+.section-card {{ animation: fadeInUp 0.5s ease both; }}
+.section-card:nth-child(1) {{ animation-delay: 0.1s; }}
+.section-card:nth-child(2) {{ animation-delay: 0.15s; }}
+.section-card:nth-child(3) {{ animation-delay: 0.2s; }}
+.section-card:nth-child(4) {{ animation-delay: 0.25s; }}
+.section-card:nth-child(5) {{ animation-delay: 0.3s; }}
+.section-card:nth-child(6) {{ animation-delay: 0.35s; }}
+
+/* Responsive */
+@media (max-width: 640px) {{
+  .container {{ padding: 0 16px; }}
+  .section-card {{ padding: 20px 18px; }}
+  .hero-title {{ font-size: 1.4rem; }}
+  .section-block {{ padding: 18px 16px; }}
 }}
 </style>
 </head>
 <body>
-<div class="page">
 
-<!-- Header -->
-<div class="badge-line">VIDEO LEARNING NOTES</div>
-<h1>{escape_html(title_cn)}</h1>
-<div class="meta-row">
-  <span class="pill {diff_class}">{diff_label}</span>
-  <span class="pill pill-cat">{escape_html(category)}</span>
-  {f'<span class="pill pill-mono">{escape_html(speaker)}</span>' if speaker else ''}
-  {f'<span class="pill pill-mono">{duration_str}</span>' if duration_str else ''}
-  <span class="pill pill-mono">{date_str}</span>
-  {yt_btn}
-</div>
-{f'<div style="margin-bottom:16px">{tags_html}</div>' if tags_html else ''}
+<div class="container">
+  <nav class="back-nav">
+    <a href="../../../" class="back-link">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
+      Archive
+    </a>
+  </nav>
 
-<!-- Overview -->
-<div class="overview">{escape_html(overview)}</div>
+  <section class="hero">
+    <div class="video-embed">
+      {video_embed}
+    </div>
 
-<!-- Video Embed -->
-{f'<div class="module"><div class="module-title">视频播放</div>{video_embed_html}</div>' if video_embed_html else ""}
+    <h1 class="hero-title">{escape_html(title_cn)}</h1>
 
-<!-- Main Content Sections -->
-<div class="module">
-  <div class="module-title">详细内容</div>
-  {sections_html if sections_html else '<p class="empty-hint">暂无详细内容分析</p>'}
-</div>
+    <div class="hero-meta">
+      {platform_badge}
+      {score_badge}
+      {duration_badge}
+      {date_badge}
+    </div>
+  </section>
 
-<!-- Resources -->
-<div class="module">
-  <div class="module-title">工具与资源</div>
-  <div class="section-block" style="padding:20px 24px">
-    {resources_html}
+  <!-- Overview -->
+  <div class="section-card">
+    <div class="section-label">Overview</div>
+    <div class="tag-row">
+      {difficulty_tag}
+      {category_tag}
+      {speaker_tag}
+    </div>
+    <div class="section-text">{escape_html(overview)}</div>
   </div>
-</div>
 
-<!-- Key Tips -->
-{f"""<div class="module">
-  <div class="module-title">实用技巧与最佳实践</div>
-  <div class="section-block" style="padding:16px 20px">
-    {tips_html}
+  <!-- Key Knowledge Points -->
+  <div class="section-card">
+    <div class="section-label">Key Knowledge</div>
+    <ul class="knowledge-list">
+      {knowledge_items}
+    </ul>
   </div>
-</div>""" if tips_html else ""}
 
-<!-- Hardware Requirements -->
-{f"""<div class="module">
-  <div class="module-title">硬件要求</div>
-  <div class="hw-box">{escape_html(hw_req)}</div>
-</div>""" if hw_req else ""}
+  <!-- Detailed Content -->
+  {f"""<div class="section-card">
+    <div class="section-label">Detailed Content</div>
+    {sections_html}
+  </div>""" if sections_html else ""}
 
-<!-- FAQ -->
-{f"""<div class="module">
-  <div class="module-title">常见问题</div>
+  <!-- Chapters -->
+  <div class="section-card">
+    <div class="section-label">Chapters</div>
+    {chapter_items}
+  </div>
+
+  <!-- Quotes -->
+  <div class="section-card">
+    <div class="section-label">Notable Quotes</div>
+    {quote_items}
+  </div>
+
+  <!-- Takeaways -->
+  <div class="section-card">
+    <div class="section-label">Takeaways</div>
+    <ul class="takeaway-list">
+      {takeaway_items}
+    </ul>
+  </div>
+
+  <!-- Resources -->
+  <div class="section-card">
+    <div class="section-label">Tools & Resources</div>
+    <table class="resource-table">
+      <thead><tr><th>Name</th><th>Description</th><th>Link</th></tr></thead>
+      <tbody>
+        {resource_rows}
+      </tbody>
+    </table>
+  </div>
+
   {faq_html}
-</div>""" if faq_html else ""}
 
-<!-- Target Audience -->
-{f"""<div class="module">
-  <div class="module-title">适用人群</div>
-  <div class="section-block" style="padding:16px 24px">
-    {audience_html}
-  </div>
-</div>""" if audience_html else ""}
+  {summary_html}
 
-<!-- Summary -->
-{f"""<div class="module">
-  <div class="module-title">总结</div>
-  <div class="summary-box"><p>{escape_html(summary)}</p></div>
-</div>""" if summary else ""}
-
-<!-- Related Links -->
-{f"""<div class="module">
-  <div class="module-title">相关链接</div>
-  <div class="section-block" style="padding:16px 24px">
-    {links_html}
-  </div>
-</div>""" if links_html else ""}
-
-<div class="foot">
-  Powered by <a href="https://github.com/anthropics/claude-code" target="_blank">Claude Code</a> video-learn skill
+  <footer class="report-footer">
+    powered by video-learn
+  </footer>
 </div>
 
-</div>
-
-<script>/* video-learn report */</script>
+<script>
+// Chapter accordion
+document.querySelectorAll('.chapter-header').forEach(header => {{
+  header.addEventListener('click', () => {{
+    header.parentElement.classList.toggle('open');
+  }});
+}});
+</script>
 </body>
 </html>'''
     return html
@@ -605,7 +976,7 @@ def main():
     with open(args.analysis_json, "r", encoding="utf-8") as f:
         analysis = json.load(f)
 
-    title = args.title or analysis.get("_meta", {}).get("title", "学习笔记")
+    title = args.title or analysis.get("_meta", {}).get("title", "Learning Notes")
 
     video_b64 = None
     if args.video_base64_path and os.path.isfile(args.video_base64_path):

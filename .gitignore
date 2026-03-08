@@ -7,3 +7,6 @@ __pycache__/
 *.swo
 *~
 .env
+.api_config.json
+.sync_config.json
+.sync_queue.json
